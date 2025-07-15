@@ -1,6 +1,9 @@
 #include <libjerrycan.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/stl_bind.h> // For binding specific STL containers if needed
+#include <optional> // For std::optional
+#include <variant>
 
 namespace py = pybind11;
 
@@ -13,10 +16,34 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .def("Close", &JerryCAN::Close, py::call_guard<py::gil_scoped_release>())
         .def("SendMessage", &JerryCAN::SendMessage, py::arg("msg"), py::arg("dst_id"),
              py::call_guard<py::gil_scoped_release>())
-        .def("ReceiveMessage", [](const JerryCAN &j) {
+        .def("ReceiveMessage", [](const JerryCAN &j, int collect_ms = 0) -> std::variant<jerrycan_msg_t, std::vector<jerrycan_msg_t>, std::nullopt_t> {
             jerrycan_msg_t msg;
-            const auto ret = j.ReceiveMessage(msg);
-            return ret < 0 ? std::nullopt : std::make_optional(msg);
+            std::vector<jerrycan_msg_t> res_vec;
+            auto end = std::chrono::high_resolution_clock::now() + std::chrono::milliseconds(collect_ms);
+            {
+                while (true) {
+                    const auto ret = j.ReceiveMessage(msg);
+                    if (ret >= 0) {
+                        res_vec.push_back(msg);
+                    }
+                    if (collect_ms == 0 || std::chrono::high_resolution_clock::now() > end) {
+                        break;
+                    }
+                    if (ret < 0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
+            }
+            if (collect_ms == 0) {
+                if (res_vec.size() == 0) {
+                    return {std::nullopt};
+                }
+                return {res_vec[0]};
+            }
+            if (res_vec.size() == 0) {
+                return {std::nullopt};
+            }
+            return {res_vec};
         }, py::call_guard<py::gil_scoped_release>())
         .def("Heartbeat", &JerryCAN::Heartbeat, py::call_guard<py::gil_scoped_release>())
         .def("EStop", &JerryCAN::EStop, py::call_guard<py::gil_scoped_release>())
