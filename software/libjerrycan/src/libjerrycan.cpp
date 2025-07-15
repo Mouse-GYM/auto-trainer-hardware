@@ -148,11 +148,21 @@ int JerryCAN::SendMessage(const jerrycan_msg_t &msg, const uint16_t dst_id) cons
 int JerryCAN::ReceiveMessage(jerrycan_msg_t &msg) const {
     // Receive a message
     canfd_frame frame = {0};
-    if (read(_can_socket_handle, &frame, sizeof(frame)) <= 0) {
-        if (errno != EAGAIN) {
-            spdlog::error("Failed to receive CAN message: {}", errno);
+    while (true) {
+        int read_res = read(_can_socket_handle, &frame, sizeof(frame));
+        if (read_res <= 0) {
+            if (read_res == 0) {
+                return -EAGAIN;
+            }
+            if (errno != EAGAIN) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                spdlog::error("Failed to receive CAN message: {}", errno);
+            }
+            return -errno;
         }
-        return -errno;
+        break;
     }
 
     msg.type = static_cast<jerrycan_cmd_type_t>((frame.can_id >> 5) & 0x3F);
