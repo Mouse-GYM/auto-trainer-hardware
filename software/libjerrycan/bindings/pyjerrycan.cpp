@@ -9,32 +9,39 @@ PYBIND11_MODULE(pyjerrycan, m) {
     m.doc() = "JerryCAN Host Interface";
     py::class_<JerryCAN>(m, "JerryCAN")
         .def(py::init<>())
-        .def("Open", &JerryCAN::Open)
-        .def("Close", &JerryCAN::Close)
-        .def("SendMessage", &JerryCAN::SendMessage, py::arg("msg"), py::arg("dst_id"))
+        .def("Open", &JerryCAN::Open, py::call_guard<py::gil_scoped_release>())
+        .def("Close", &JerryCAN::Close, py::call_guard<py::gil_scoped_release>())
+        .def("SendMessage", &JerryCAN::SendMessage, py::arg("msg"), py::arg("dst_id"),
+             py::call_guard<py::gil_scoped_release>())
         .def("ReceiveMessage", [](const JerryCAN &j) {
             jerrycan_msg_t msg;
             const auto ret = j.ReceiveMessage(msg);
             return ret < 0 ? std::nullopt : std::make_optional(msg);
-        })
-        .def("Heartbeat", &JerryCAN::Heartbeat)
-        .def("EStop", &JerryCAN::EStop)
-        .def("StepperMove", &JerryCAN::StepperMove, py::arg("dst_id"), py::arg("motor_id"), py::arg("position"), py::arg("max_velocity"), py::arg("max_acceleration"), py::arg("abs_or_rel"), py::arg("save"), py::arg("uuid"))
-        .def("ServoMove", &JerryCAN::ServoMove, py::arg("dst_id"), py::arg("motor_id"), py::arg("position"), py::arg("max_velocity"), py::arg("max_acceleration"), py::arg("abs_or_rel"), py::arg("uuid"))
-        .def("StepperHome", &JerryCAN::StepperHome, py::arg("dst_id"), py::arg("motor_id"), py::arg("uuid"))
-        .def("StepperCfgWrite", &JerryCAN::StepperCfgWrite, py::arg("dst_id"), py::arg("motor_id"), py::arg("microsteps"), py::arg("steps_per_revolution"), py::arg("motor_max_velocity"), py::arg("motor_max_acceleration"), py::arg("homing_velocity"), py::arg("flip_limit_orientation"), py::arg("uuid"))
-        .def("ServoCfgWrite", &JerryCAN::ServoCfgWrite, py::arg("dst_id"), py::arg("motor_id"), py::arg("min_position"), py::arg("max_position"), py::arg("min_pwm_duration_us"), py::arg("max_pwm_duration_us"), py::arg("motor_max_velocity"), py::arg("motor_max_acceleration"), py::arg("uuid"))
-        .def("StepperCfgRead", &JerryCAN::StepperCfgRead, py::arg("dst_id"), py::arg("motor_id"))
-        .def("ServoCfgRead", &JerryCAN::ServoCfgRead, py::arg("dst_id"), py::arg("motor_id"))
-        .def("CfgRead", &JerryCAN::CfgRead, py::arg("dst_id"), py::arg("cfg"))
-        .def("GPIOWrite", &JerryCAN::GPIOWrite, py::arg("dst_id"), py::arg("instance"), py::arg("gpio_idx"), py::arg("state"), py::arg("uuid"))
-        .def("ToneWrite", &JerryCAN::ToneWrite, py::arg("dst_id"), py::arg("instance"), py::arg("frequency"), py::arg("duration"), py::arg("uuid"))
-        .def("AnalogOutWrite", &JerryCAN::AnalogOutWrite, py::arg("dst_id"), py::arg("instance"), py::arg("value_mv"), py::arg("uuid"))
-        .def("LoadCellTare", &JerryCAN::LoadCellTare, py::arg("dst_id"), py::arg("instance"), py::arg("uuid"))
-        .def("RGBLEDWrite", &JerryCAN::RGBLEDWrite, py::arg("dst_id"), py::arg("red"), py::arg("green"), py::arg("blue"), py::arg("uuid"))
-        .def("BootloaderCommand", &JerryCAN::BootloaderCommand, py::arg("dst_id"), py::arg("subcmd"))
-        .def("Delay", &JerryCAN::Delay, py::arg("dst_id"), py::arg("delay"), py::arg("uuid"))
-        .def("SendToFixedXYZ", &JerryCAN::SendToFixedXYZ, py::arg("dst_id"), py::arg("uuid"))
+        }, py::call_guard<py::gil_scoped_release>())
+        .def("Heartbeat", &JerryCAN::Heartbeat, py::call_guard<py::gil_scoped_release>())
+        .def("EStop", &JerryCAN::EStop, py::call_guard<py::gil_scoped_release>())
+        .def("StepperMove", &JerryCAN::StepperMove,
+             py::arg("dst_id"), py::arg("motor_id"), py::arg("position"), py::arg("max_velocity"), py::arg("max_acceleration"), py::arg("abs_or_rel"), py::arg("save"), py::arg("uuid"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("ServoMove", &JerryCAN::ServoMove, py::arg("dst_id"), py::arg("motor_id"), py::arg("position"), py::arg("max_velocity"), py::arg("max_acceleration"), py::arg("abs_or_rel"), py::arg("uuid"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("StepperHome", &JerryCAN::StepperHome, py::arg("dst_id"), py::arg("motor_id"), py::arg("uuid"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("StepperCfgWrite", &JerryCAN::StepperCfgWrite, py::arg("dst_id"), py::arg("motor_id"), py::arg("microsteps"), py::arg("steps_per_revolution"), py::arg("motor_max_velocity"), py::arg("motor_max_acceleration"), py::arg("homing_velocity"), py::arg("flip_limit_orientation"), py::arg("uuid"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("ServoCfgWrite", &JerryCAN::ServoCfgWrite, py::arg("dst_id"), py::arg("motor_id"), py::arg("min_position"), py::arg("max_position"), py::arg("min_pwm_duration_us"), py::arg("max_pwm_duration_us"), py::arg("motor_max_velocity"), py::arg("motor_max_acceleration"), py::arg("uuid"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("StepperCfgRead", &JerryCAN::StepperCfgRead, py::arg("dst_id"), py::arg("motor_id"), py::call_guard<py::gil_scoped_release>())
+        .def("ServoCfgRead", &JerryCAN::ServoCfgRead, py::arg("dst_id"), py::arg("motor_id"), py::call_guard<py::gil_scoped_release>())
+        .def("CfgRead", &JerryCAN::CfgRead, py::arg("dst_id"), py::arg("cfg"), py::call_guard<py::gil_scoped_release>())
+        .def("GPIOWrite", &JerryCAN::GPIOWrite, py::arg("dst_id"), py::arg("instance"), py::arg("gpio_idx"), py::arg("state"), py::arg("uuid"), py::call_guard<py::gil_scoped_release>())
+        .def("ToneWrite", &JerryCAN::ToneWrite, py::arg("dst_id"), py::arg("instance"), py::arg("frequency"), py::arg("duration"), py::arg("uuid"), py::call_guard<py::gil_scoped_release>())
+        .def("AnalogOutWrite", &JerryCAN::AnalogOutWrite, py::arg("dst_id"), py::arg("instance"), py::arg("value_mv"), py::arg("uuid"), py::call_guard<py::gil_scoped_release>())
+        .def("LoadCellTare", &JerryCAN::LoadCellTare, py::arg("dst_id"), py::arg("instance"), py::arg("uuid"), py::call_guard<py::gil_scoped_release>())
+        .def("RGBLEDWrite", &JerryCAN::RGBLEDWrite, py::arg("dst_id"), py::arg("red"), py::arg("green"), py::arg("blue"), py::arg("uuid"), py::call_guard<py::gil_scoped_release>())
+        .def("BootloaderCommand", &JerryCAN::BootloaderCommand, py::arg("dst_id"), py::arg("subcmd"), py::call_guard<py::gil_scoped_release>())
+        .def("Delay", &JerryCAN::Delay, py::arg("dst_id"), py::arg("delay"), py::arg("uuid"), py::call_guard<py::gil_scoped_release>())
+        .def("SendToFixedXYZ", &JerryCAN::SendToFixedXYZ, py::arg("dst_id"), py::arg("uuid"), py::call_guard<py::gil_scoped_release>())
     ;
 
     py::class_<jerrycan_msg_t>(m, "JerryCANMsg")
