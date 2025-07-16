@@ -148,21 +148,15 @@ int JerryCAN::SendMessage(const jerrycan_msg_t &msg, const uint16_t dst_id) cons
 int JerryCAN::ReceiveMessage(jerrycan_msg_t &msg) const {
     // Receive a message
     canfd_frame frame = {0};
-    while (true) {
-        int read_res = read(_can_socket_handle, &frame, sizeof(frame));
-        if (read_res <= 0) {
-            if (read_res == 0) {
-                return -EAGAIN;
-            }
-            if (errno != EAGAIN) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                spdlog::error("Failed to receive CAN message: {}", errno);
-            }
-            return -errno;
+    int read_res = read(_can_socket_handle, &frame, sizeof(frame));
+    if (read_res <= 0) {
+        if (read_res == 0) {
+            return -EAGAIN;
         }
-        break;
+        if (errno != EAGAIN && errno != EINTR) {
+            spdlog::error("Failed to receive CAN message: {}", errno);
+        }
+        return -errno;
     }
 
     msg.type = static_cast<jerrycan_cmd_type_t>((frame.can_id >> 5) & 0x3F);
@@ -174,6 +168,37 @@ int JerryCAN::ReceiveMessage(jerrycan_msg_t &msg) const {
     }
 
     return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+
+std::vector<jerrycan_msg_t>
+JerryCAN::ReceiveMessages(
+    unsigned int max_count,
+    unsigned int collect_ms
+) const {
+    jerrycan_msg_t msg;
+    std::vector<jerrycan_msg_t> res_vec;
+    auto end = std::chrono::high_resolution_clock::now() + std::chrono::milliseconds(collect_ms);
+    while (true) {
+        // ReceiveMessage->read is currently blocking for 1 ms when no message immediatelly available.
+        const auto ret = this->ReceiveMessage(msg);  // so no need sleep between calls
+        if (ret == 0) {
+            res_vec.push_back(msg);
+            if (max_count > 0 and res_vec.size() >= max_count) {
+                break;
+            }
+        } else if (ret == -EINTR) {
+            break;
+        } else if (ret != -EAGAIN && ret != -EWOULDBLOCK) {
+            // neither EINTR or EAGAIN, should raise/throw an error instead
+            break;
+        }
+        if (collect_ms == 0 || std::chrono::high_resolution_clock::now() > end) {
+            break;
+        }
+    }
+    return res_vec;
 }
 
 /* -------------------------------------------------------------------------- */

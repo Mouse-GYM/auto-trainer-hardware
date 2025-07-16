@@ -1,9 +1,11 @@
-#include <libjerrycan.h>
+#include <optional> // For std::optional
+#include <variant>
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h> // For binding specific STL containers if needed
-#include <optional> // For std::optional
-#include <variant>
+
+#include <libjerrycan.h>
 
 namespace py = pybind11;
 
@@ -16,35 +18,15 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .def("Close", &JerryCAN::Close, py::call_guard<py::gil_scoped_release>())
         .def("SendMessage", &JerryCAN::SendMessage, py::arg("msg"), py::arg("dst_id"),
              py::call_guard<py::gil_scoped_release>())
-        .def("ReceiveMessage", [](const JerryCAN &j, int collect_ms = 0) -> std::variant<jerrycan_msg_t, std::vector<jerrycan_msg_t>, std::nullopt_t> {
-            jerrycan_msg_t msg;
-            std::vector<jerrycan_msg_t> res_vec;
-            auto end = std::chrono::high_resolution_clock::now() + std::chrono::milliseconds(collect_ms);
-            {
-                while (true) {
-                    const auto ret = j.ReceiveMessage(msg);
-                    if (ret >= 0) {
-                        res_vec.push_back(msg);
-                    }
-                    if (collect_ms == 0 || std::chrono::high_resolution_clock::now() > end) {
-                        break;
-                    }
-                    if (ret < 0) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
-                }
-            }
-            if (collect_ms == 0) {
-                if (res_vec.size() == 0) {
-                    return {std::nullopt};
-                }
-                return {res_vec[0]};
-            }
-            if (res_vec.size() == 0) {
-                return {std::nullopt};
-            }
-            return {res_vec};
-        }, py::call_guard<py::gil_scoped_release>())
+        .def("ReceiveMessages", &JerryCAN::ReceiveMessages, py::arg("max_count") = 1, py::arg("collect_ms") = 0, py::call_guard<py::gil_scoped_release>())
+        .def("ReceiveMessage", [](const JerryCAN &j, int max_count = 1, int collect_ms = 0) -> std::variant<jerrycan_msg_t, std::vector<jerrycan_msg_t>, std::nullptr_t> {
+            auto msgs = j.ReceiveMessages(max_count, collect_ms);
+            if (msgs.size() == 0)
+                return nullptr;
+            if (msgs.size() > 1)
+                return msgs;
+            return msgs[0];
+        }, py::arg("max_count") = 1, py::arg("collect_ms") = 0, py::call_guard<py::gil_scoped_release>())
         .def("Heartbeat", &JerryCAN::Heartbeat, py::call_guard<py::gil_scoped_release>())
         .def("EStop", &JerryCAN::EStop, py::call_guard<py::gil_scoped_release>())
         .def("StepperMove", &JerryCAN::StepperMove,

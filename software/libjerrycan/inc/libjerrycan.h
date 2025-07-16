@@ -1,5 +1,8 @@
 #pragma once
 
+#include <variant>
+#include <vector>
+#include <optional>
 #include "jerrycan_types.h"
 
 class JerryCAN {
@@ -13,6 +16,12 @@ class JerryCAN {
     [[nodiscard]] int SendMessage(const jerrycan_msg_t &msg, uint16_t dst_id) const;
 
     int ReceiveMessage(jerrycan_msg_t &msg) const;
+
+    std::vector<jerrycan_msg_t>
+    ReceiveMessages(
+        unsigned int max_count = 1,
+        unsigned int collect_ms = 0
+    ) const;
 
     [[nodiscard]] int Heartbeat() const;
 
