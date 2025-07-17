@@ -19,14 +19,11 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .def("SendMessage", &JerryCAN::SendMessage, py::arg("msg"), py::arg("dst_id"),
              py::call_guard<py::gil_scoped_release>())
         .def("ReceiveMessages", &JerryCAN::ReceiveMessages, py::arg("max_count") = 1, py::arg("collect_ms") = 0, py::call_guard<py::gil_scoped_release>())
-        .def("ReceiveMessage", [](const JerryCAN &j, int max_count = 1, int collect_ms = 0) -> std::variant<jerrycan_msg_t, std::vector<jerrycan_msg_t>, std::nullptr_t> {
-            auto msgs = j.ReceiveMessages(max_count, collect_ms);
-            if (msgs.size() == 0)
-                return nullptr;
-            if (msgs.size() > 1)
-                return msgs;
-            return msgs[0];
-        }, py::arg("max_count") = 1, py::arg("collect_ms") = 0, py::call_guard<py::gil_scoped_release>())
+        .def("ReceiveMessage", [](const JerryCAN &j) {
+            jerrycan_msg_t msg;
+            const auto ret = j.ReceiveMessage(msg);
+            return ret < 0 ? std::nullopt : std::make_optional(msg);
+        }, py::call_guard<py::gil_scoped_release>())
         .def("Heartbeat", &JerryCAN::Heartbeat, py::call_guard<py::gil_scoped_release>())
         .def("EStop", &JerryCAN::EStop, py::call_guard<py::gil_scoped_release>())
         .def("StepperMove", &JerryCAN::StepperMove,

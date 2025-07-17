@@ -185,7 +185,7 @@ JerryCAN::ReceiveMessages(
         const auto ret = this->ReceiveMessage(msg);  // so no need sleep between calls
         if (ret == 0) {
             res_vec.push_back(msg);
-            if (max_count > 0 and res_vec.size() >= max_count) {
+            if (max_count > 0 && res_vec.size() >= max_count) {
                 break;
             }
         } else if (ret == -EINTR) {
