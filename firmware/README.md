@@ -1,97 +1,80 @@
 # Autotrainer Firmware
 
-## Setup
+## Building the Firmware with Docker
 
-This project is built on the Zephyr RTOS. It uses the West tool in order to handle various project tasks,
-such as building and flashing.
-
-See the Zephyr Getting Started Guide for how to install the various tools needed for developers
-https://docs.zephyrproject.org/latest/develop/getting_started/index.html
-
-It is recommended to do `west config build.sysbuild True` to have West default to using sysbuild at all times.
-
-### Python Virtual Environment
-
-You will also want to create a virtual environment for this build:
+The preferred build method uses the same Zephyr SDK container as CI. Clone the
+repository on the host so the source, downloaded West dependencies, and build outputs
+remain available after the container exits:
 
 ```bash
-cd <parent>/autotrainer
-python -m venv .venv
-
-# Then activate the virtual environment
-source .venv/bin/activate
+cd "$HOME"
+git clone https://github.com/Mouse-GYM/auto-trainer-hardware.git
+cd "$HOME/auto-trainer-hardware"
+docker pull ghcr.io/mouse-gym/auto-trainer-hardware/zephyr-sdk:latest
+docker run --rm -it \
+  --volume "$(pwd):/auto-trainer-hardware" \
+  --workdir /auto-trainer-hardware \
+  ghcr.io/mouse-gym/auto-trainer-hardware/zephyr-sdk:latest
 ```
 
-### Initializing Project Workspace
-
-Once West is installed, initialize the project workspace:
+The remaining commands in this section run inside the container. Initialize the West
+workspace and download the dependencies declared in `firmware/west.yml`:
 
 ```bash
-cd <parent>/autotrainer
+cd /auto-trainer-hardware/firmware
 west init -l
 west update
 ```
 
-Install the python requirements:
-```bash
-cd firmware
-pip install -r requirements.txt
-```
+Each native board produces two firmware images:
 
-And install tools to support flashing the firmware:
-```bash
-pyocd pack install stm32g4
-```
-
-## Building an Application
-
-For each board (pellet and magnet), there are two firmware images that need to be built: 
 * MCUBoot
-* Application
+* The signed application
 
-West implements sysbuild which coordinates building both of these projects for us.
+West sysbuild coordinates both builds.
 
-### Building Pellet Module
-
-The first time building the project (or if you ever delete the `build` directory), run this command:
+### Building the Pellet Module for Its Native Board
 
 ```bash
-cd firmware/pellet_module
-west build --sysbuild --board cerebellumlab_pellet_module -p
+cd /auto-trainer-hardware/firmware/pellet_module
+west build -p --sysbuild -b cerebellumlab_pellet_module
 ```
 
-Thereafter, this command is sufficient:
+The application images are:
+
+* `firmware/pellet_module/build/pellet_module/zephyr/zephyr.signed.hex`
+* `firmware/pellet_module/build/pellet_module/zephyr/zephyr.signed.bin`
+
+The bootloader images are:
+
+* `firmware/pellet_module/build/mcuboot/zephyr/zephyr.hex`
+* `firmware/pellet_module/build/mcuboot/zephyr/zephyr.bin`
+
+### Building the Magnet Module for Its Native Board
 
 ```bash
-west build
+cd /auto-trainer-hardware/firmware/magnet_module
+west build -p --sysbuild -b cerebellumlab_magnet_module
 ```
 
-The resulting file is: `firmware/pellet_module/build/pellet_module/zephyr/zephyr.signed.bin`
+The application images are:
 
-### Building Magnet Module
+* `firmware/magnet_module/build/magnet_module/zephyr/zephyr.signed.hex`
+* `firmware/magnet_module/build/magnet_module/zephyr/zephyr.signed.bin`
 
-The first time building the project (or if you ever delete the `build` directory), run this command:
+The bootloader images are:
 
-```bash
-cd firmware/magnet_module
-west build --sysbuild --board cerebellumlab_magnet_module -p
-```
+* `firmware/magnet_module/build/mcuboot/zephyr/zephyr.hex`
+* `firmware/magnet_module/build/mcuboot/zephyr/zephyr.bin`
 
-Thereafter, this command is sufficient:
+After a module has been configured once, `west build` from that module's directory is
+sufficient for subsequent builds. Use the full command above after deleting a `build`
+directory or when changing boards.
 
-```bash
-west build
-```
+## Flashing and Logging
 
-The resulting file is: `firmware/magnet_module/build/magnet_module/zephyr/zephyr.signed.bin`
-
-## Flashing an Application
-
-To flash a module, cd to the desired application directory and issue:
-
-```bash
-west flash
-```
+See [FLASHING.md](FLASHING.md) for initial programming, USB DFU, and subsequent firmware updates.
+See [LOGGING.md](LOGGING.md) for console connections, USB CDC ACM, and log-level configuration.
 
 ## Functional Description
 
@@ -131,51 +114,7 @@ The magnet module controls and provides status for the following:
 * Pressure sensor
 * Head Fix detection
 
-# CU Python Application Code
-
-## Setup
-
-The code resides at: https://github.com/Mouse-GYM/auto-trainer
-
-If the python code is run on the Jetson, there is no need to create a running
-environment on the development machine. However, it is more convenient to run
-the application code on the development machine.
-
-For the work under the purview of firmware, the camera and other device support is 
-not required for development against the firmware.
-
-This information is pulled from the Python repo README and may be incomplete:
-
-### Installation for Development Environment
-* Install support packages
-
-```bash
-sudo apt-get install libhdf5-serial-dev
-sudo apt-get install libxcb-cursor0 
-````
-
-* See online documentation for installation of anaconda (miniconda is sufficient for development)
-* Create the virtual environment
-```bash
-  conda create --name <name> python=3.8
-```
-
-* Initialize the virtual environment
-```shell
-conda init
-```
-
-* Enable the environment
-```bash
-conda activate <name>
-```
-
-* Install supporting python packages
-```shell
-cd <parnet>/auto-trainer
-pip install -r requirements.txt
-pip install -r requirements-test.txt
-```
+# Python Integration
 
 ## Libjerrycan
 
@@ -198,38 +137,6 @@ pip install ./libjerrycan
 **Note**: To avoid inconsistencies in environments, it is recommended to activate 
 the conda environment from a bare shell, not from the virtual environment that is needed
 to develop the firmware.
-
-## Device Python Package
-
-In the auto-trainer Python repository, all hardware interaction software is 
-in the auto-trainer-device. In that directory, there may be (unless its been deprecated)
-references to a serial device (original device); that code can be generally ignored.
-
-In that part of the source code, there are two files of interest:
-* can_interface.py - It's an extra layer between the libjerrycan library and the rest
-of the application. It transforms data sets from a libjerrycan-specific structure to
-a more generic set of classes, and provides ease-of-use methods to command the
-different aspects of the hardware (e.g. run a motor). It does it in a way that the
-source/destination of the data/commands is agnostic - the auto trainer device controls
-appears as a single piece of hardware.
-* can_device.py - This layer conforms to a send message/receive data protocol that 
-abstracts the interface to the underlying hardware. This allows easy swap-out of legacy
-hardware with the updated hardware.
-
-## Supporting Applications
-
-To date, only 3 applications have been supported by the firmware development team:
-
-* CAN console - A console application that allows quick-and-easy access to
-the functionality provided by can_device.py. It's a console menu-driven application.
-  * It resides in scripts/can_console.py
-* HEAD Fix U/I - A U/I front end that provides most of the same support that CAN 
-console does, only with a U/I front end, and only those items supported by the 
-magnet module (exception: Tone generation).
-  * It resides in tools/head_fix.
-* Pellet U/I - A U/I front end that provides most of the same support that CAN console 
-does, only with a U/I front end, and only those items supported by the pellet module.
-  * It resides in tools/pellet_delivery.
   
 # Bootloader
 
@@ -299,3 +206,94 @@ CONFIG_CMSIS_DSP_TRANSFORM=y
 similar. For some reason, it excludes the FFT library files if you do that.
 * There is no need to link the CMSIS DSP library in the CMakeLists.txt. In fact,
 _don't do that_ either.
+
+## Building the Pellet Module for a NUCLEO-G474RE
+
+The pellet module firmware also builds for ST's NUCLEO-G474RE development board,
+which carries the same STM32G474RE. After initializing the West workspace as described
+above, run this command inside the container:
+
+```bash
+cd /auto-trainer-hardware/firmware/pellet_module
+west build -p --sysbuild -b nucleo_g474re
+```
+
+The resulting application images are:
+
+* `firmware/pellet_module/build/pellet_module/zephyr/zephyr.hex`
+* `firmware/pellet_module/build/pellet_module/zephyr/zephyr.bin`
+
+This is a bring-up target, not a second product configuration. Two differences are
+worth knowing:
+
+* **No bootloader.** The dev board has 512K of internal flash and no external SPI-NOR
+  to hold a second image slot, and two slots large enough for this firmware do not fit.
+  `sysbuild_nucleo_g474re.conf` selects `SB_CONFIG_BOOTLOADER_NONE`, so the JerryCAN
+  bootloader commands are absent and the image is flashed directly rather than signed.
+* **Pins are stand-ins.** Every peripheral instance, DMAMUX request line and timer
+  matches the pellet module board, but the pins are remapped onto ones the Nucleo
+  brings out on its Arduino and ST-morpho headers. `boards/nucleo_g474re.overlay`
+  lists the full map. Nothing is wired to real hardware, and the board has no CAN
+  transceiver, so FDCAN1 (PA11/PA12) needs one attached to talk to anything.
+
+# Building on the Host without the Docker Image
+
+This project uses Zephyr RTOS 3.7.0, West for project management, and Zephyr SDK
+0.16.8. The commands below install the same minimal SDK and ARM toolchain used by the
+Docker image. `$HOME` is one of Zephyr's default SDK search locations, and the `-c`
+option also registers the SDK in the current user's CMake package registry.
+
+On a 64-bit x86 Linux host, run:
+
+```bash
+cd "$HOME"
+wget https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.16.8/zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz
+tar xf zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz
+rm zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz
+cd zephyr-sdk-0.16.8
+./setup.sh -t arm-zephyr-eabi -c -h
+```
+
+On a 64-bit ARM Linux host, run:
+
+```bash
+cd "$HOME"
+wget https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.16.8/zephyr-sdk-0.16.8_linux-aarch64_minimal.tar.xz
+tar xf zephyr-sdk-0.16.8_linux-aarch64_minimal.tar.xz
+rm zephyr-sdk-0.16.8_linux-aarch64_minimal.tar.xz
+cd zephyr-sdk-0.16.8
+./setup.sh -t arm-zephyr-eabi -c -h
+```
+
+Run `setup.sh` as your normal user so CMake registration is written to that user's
+package registry. The [Zephyr 3.7.0 Getting Started Guide](https://docs.zephyrproject.org/3.7.0/develop/getting_started/index.html)
+has additional operating-system dependency, SDK verification, and flashing setup
+information.
+
+## Python Virtual Environment
+
+Create and activate a virtual environment in the cloned repository, then install West
+and this project's Python requirements:
+
+```bash
+cd "$HOME/auto-trainer-hardware"
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install west
+python -m pip install -r firmware/requirements.txt
+```
+
+## Initializing the Project Workspace
+
+Initialize the workspace and install the device pack used to flash the STM32G4:
+
+```bash
+cd firmware
+west init -l
+west update
+west config build.sysbuild true
+pyocd pack install stm32g4
+```
+
+You can now use the native-board or NUCLEO-G474RE build commands in this document,
+replacing the `/auto-trainer-hardware` container path with the path to your local clone.

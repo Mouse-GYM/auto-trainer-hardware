@@ -1,0 +1,33 @@
+/*
+ * Flash map used when the pellet module firmware is built for a NUCLEO-G474RE.
+ *
+ * No bootloader in this build (see sysbuild_nucleo_g474re.conf), so the image gets
+ * everything except the settings storage at the top of the 512K. Erase block size
+ * is 2K, so both boundaries are 2K aligned.
+ */
+
+&flash0 {
+	/delete-node/ partitions;
+
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		code_partition: partition@0 {
+			label = "image-0";
+			reg = <0x00000000 DT_SIZE_K(480)>;
+		};
+
+		storage_partition: partition@78000 {
+			label = "storage";
+			reg = <0x00078000 DT_SIZE_K(32)>;
+		};
+	};
+};
+
+/ {
+	chosen {
+		zephyr,code-partition = &code_partition;
+	};
+};
