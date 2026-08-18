@@ -109,8 +109,11 @@ int jerrycan_run(k_timeout_t timeout) {
     static struct can_frame frame;
     int ret;
 
+#ifdef CONFIG_BOOTLOADER_MCUBOOT
+    // Defined in modules/bootloader.c, which is only built with MCUboot
     void confirm_image();
     confirm_image();
+#endif
 
     static struct k_poll_event events[2] = {
         K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_MSGQ_DATA_AVAILABLE, K_POLL_MODE_NOTIFY_ONLY, &jerrycan_tx_msgq, 1),

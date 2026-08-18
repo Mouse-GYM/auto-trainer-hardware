@@ -98,6 +98,21 @@ build_pellet_firmware:
     MODULE: pellet_module
     BOARD: cerebellumlab_pellet_module
 
+build_pellet_firmware_nucleo_g474re:
+  <<: *build_firmware_template
+  variables:
+    MODULE: pellet_module
+    BOARD: nucleo_g474re
+  script:
+    - cd firmware
+    - west init -l
+    - west update
+    - cd ${MODULE}
+    - west build -p --sysbuild -b ${BOARD}
+    - GIT_DESCRIBE=$(git describe --tags --always --dirty)
+    - cp build/${MODULE}/zephyr/zephyr.hex ../${MODULE}_${BOARD}_fw_${GIT_DESCRIBE}.hex
+    - cp build/${MODULE}/zephyr/zephyr.bin ../${MODULE}_${BOARD}_fw_${GIT_DESCRIBE}.bin
+
 build_magnet_firmware:
   <<: *build_firmware_template
   variables:

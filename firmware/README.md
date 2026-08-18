@@ -85,6 +85,31 @@ west build
 
 The resulting file is: `firmware/magnet_module/build/magnet_module/zephyr/zephyr.signed.bin`
 
+### Building the Pellet Module for a NUCLEO-G474RE
+
+The pellet module firmware also builds for ST's NUCLEO-G474RE dev board, which carries
+the same STM32G474RE:
+
+```bash
+cd firmware/pellet_module
+west build --sysbuild --board nucleo_g474re -p
+```
+
+The resulting file is: `firmware/pellet_module/build/pellet_module/zephyr/zephyr.bin`
+
+This is a bring-up target, not a second product configuration. Two differences are
+worth knowing:
+
+* **No bootloader.** The dev board has 512K of internal flash and no external SPI-NOR
+  to hold a second image slot, and two slots large enough for this firmware do not fit.
+  `sysbuild_nucleo_g474re.conf` selects `SB_CONFIG_BOOTLOADER_NONE`, so the JerryCAN
+  bootloader commands are absent and the image is flashed directly rather than signed.
+* **Pins are stand-ins.** Every peripheral instance, DMAMUX request line and timer
+  matches the pellet module board, but the pins are remapped onto ones the Nucleo
+  brings out on its Arduino and ST-morpho headers. `boards/nucleo_g474re.overlay`
+  lists the full map. Nothing is wired to real hardware, and the board has no CAN
+  transceiver, so FDCAN1 (PA11/PA12) needs one attached to talk to anything.
+
 ## Flashing an Application
 
 To flash a module, cd to the desired application directory and issue:

@@ -1,58 +1,56 @@
-/dts-v1/;
-#include <st/g4/stm32g474Xe.dtsi>
-#include <st/g4/stm32g474r(b-c-e)tx-pinctrl.dtsi>
-#include <zephyr/dt-bindings/input/input-event-codes.h>
+/*
+ * Pellet module firmware on a NUCLEO-G474RE dev board.
+ *
+ * Same SoC as the pellet module, so every peripheral instance and DMAMUX request
+ * line is kept identical to boards/arm/cerebellumlab_pellet_module; only the pins
+ * move, onto pins that the Nucleo brings out on the Arduino/ST-morpho headers.
+ * Nothing here is wired to real hardware - this exists so the firmware builds and
+ * boots on the dev board.
+ *
+ *   ext_button_1   PC13  B1 (user button)      door_sensor_1  PB8   D15
+ *   door_sensor_2  PB10  D6                    door_sensor_3  PA15  CN7-17
+ *   CAN_ID[0..3]   PC10  PC11  PB0  PB1        STIM0..3       PB11..PB14
+ *   rgb red/green/blue   PB5 (D4)  PB6 (D10)  PB7 (CN7-21)
+ *   servo0/1/2     PA1 (A1)  PB15 (CN10-26)  PB9 (D14)
+ *   stepper0 step/dir/limit  PC2  PC3  PA8 (D7)
+ *   stepper1 step/dir/limit  PC9  PC6  PA9 (D8)
+ *   stepper2 step/dir/limit  PC8  PC7 (D9)  PA10 (D2)
+ *   TMC2209 UART   PC4/PC5 (D1/D0)            tone DAC/enable  PA4 (A2) / PA7 (D11)
+ *   analog out     PA6 (D12)
+ */
+
+#include "nucleo_g474re_partitions.dtsi"
 
 / {
-	model = "Autotrainer Pellet Module";
-	compatible = "cerebellumlab,pellet-module";
-
-	chosen {
-		zephyr,console = &lpuart1;
-		zephyr,shell-uart = &cdc_acm_uart0;
-		zephyr,sram = &sram0;
-		zephyr,flash = &flash0;
-		zephyr,canbus = &fdcan3;
-		zephyr,code-partition = &slot0_partition;
+	aliases {
+		/* pwmleds below is deleted, so this alias would dangle */
+		/delete-property/ pwm-led0;
 	};
 
-	leds {
-		compatible = "gpio-leds";
-		status = "okay";
-
-		status_led: led_1 {
-			gpios = <&gpioa 5 GPIO_ACTIVE_HIGH>;
-			label = "STATUS_LED";
-			status = "okay";
-		};
-	};
+	/* TIM2 drives the tone generator sample rate here, as on the pellet module,
+	 * so it cannot also back the board's PWM LED. */
+	/delete-node/ pwmleds;
 
 	gpio_keys {
 		compatible = "gpio-keys";
 
-		ext_button_1: ext_button_1 {
-			label = "Ext Button 1";
-			gpios = <&gpioa 0 GPIO_ACTIVE_LOW>;
-			zephyr,code = <INPUT_KEY_0>;
-		};
-
 		door_sensor_1: door_sensor_1 {
 			label = "Door Closed 1";
-			gpios = <&gpioc 13 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>;
+			gpios = <&gpiob 8 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>;
 			zephyr,code = <INPUT_KEY_5>;
 			status = "okay";
 		};
 
 		door_sensor_2: door_sensor_2 {
 			label = "Door Closed 2";
-			gpios = <&gpioc 14 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>;
+			gpios = <&gpiob 10 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>;
 			zephyr,code = <INPUT_KEY_6>;
 			status = "okay";
 		};
 
 		door_sensor_3: door_sensor_3 {
 			label = "Door Closed 3";
-			gpios = <&gpioc 15 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>;
+			gpios = <&gpioa 15 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>;
 			zephyr,code = <INPUT_KEY_7>;
 			status = "okay";
 		};
@@ -61,10 +59,10 @@
 	generic-gpios {
 		status = "okay";
 		compatible = "ll,generic-gpios";
-		input-gpios = <&gpioc 4 GPIO_ACTIVE_LOW>,  // CAN_ID[0] / NodeNumber[0]
-					  <&gpioc 5 GPIO_ACTIVE_LOW>,  // CAN_ID[1] / NodeNumber[1]
-					  <&gpiob 0 GPIO_ACTIVE_HIGH>, // CAN_ID[2] / DeviceType[0]
-					  <&gpiob 1 GPIO_ACTIVE_HIGH>; // CAN_ID[3] / DeviceType[1]
+		input-gpios = <&gpioc 10 GPIO_ACTIVE_LOW>,  // CAN_ID[0] / NodeNumber[0]
+					  <&gpioc 11 GPIO_ACTIVE_LOW>,  // CAN_ID[1] / NodeNumber[1]
+					  <&gpiob 0 GPIO_ACTIVE_HIGH>,  // CAN_ID[2] / DeviceType[0]
+					  <&gpiob 1 GPIO_ACTIVE_HIGH>;  // CAN_ID[3] / DeviceType[1]
 		input-gpio-names = "CAN_ID[0]",
 						   "CAN_ID[1]",
 						   "CAN_ID[2]",
@@ -105,65 +103,52 @@
 		status = "okay";
 
 		red_pwm_led: red_pwm_led {
-			pwms = <&pwm3 2 PWM_MSEC(10) PWM_POLARITY_NORMAL>;	// channel #, not entry # in the pwm list in pwm3
+			pwms = <&pwm3 2 PWM_MSEC(10) PWM_POLARITY_NORMAL>;
 			label = "red";
 		};
-		
-		green_pwm_led: green_pwm_led {
+
+		green_pwm_led_rgb: green_pwm_led_rgb {
 			pwms = <&pwm4 1 PWM_MSEC(10) PWM_POLARITY_NORMAL>;
 			label = "green";
 		};
-		
+
 		blue_pwm_led: blue_pwm_led {
 			pwms = <&pwm4 2 PWM_MSEC(10) PWM_POLARITY_NORMAL>;
 			label = "blue";
 		};
 	};
-
-	aliases {
-		led0 = &status_led;
-		mcuboot-led0 = &status_led;
-		watchdog0 = &iwdg;
-	};
 };
 
-&clk_lsi {
-	status = "okay";
+/* The Nucleo's user button stands in for the external button input. */
+ext_button_1: &user_button {
+	label = "Ext Button 1";
 };
 
-&clk_hsi48 {
-	status = "okay";
+/* Freed up so their pins can serve the peripherals above:
+ * SPI1 PA5/PA6/PA7 + PB6, SPI2 PB12-PB15, SPI3 PA15 + PC10-PC12, I2C1 PB8/PB9. */
+&spi1 {
+	status = "disabled";
 };
 
-&clk_hse {
-	clock-frequency = <DT_FREQ_M(8)>;
-	status = "okay";
-	hse-bypass;
+&spi2 {
+	status = "disabled";
 };
 
-&pll {
-	div-m = <2>;
-	mul-n = <85>;
-	div-p = <2>;
-	div-q = <2>;
-	div-r = <2>;
-	clocks = <&clk_hse>;
-	status = "okay";
+&spi3 {
+	status = "disabled";
 };
 
-&rcc {
-	clocks = <&pll>;
-	clock-frequency = <DT_FREQ_M(170)>;
-	ahb-prescaler = <1>;
-	apb1-prescaler = <1>;
-	apb2-prescaler = <1>;
+&i2c1 {
+	status = "disabled";
 };
 
-&lpuart1 {
-	pinctrl-0 = <&lpuart1_tx_pc1 &lpuart1_rx_pc0>;
-	pinctrl-names = "default";
-	current-speed = <115200>;
-	status = "okay";
+/* jerrycan runs 1 Mbit/s nominal with a 5 Mbit/s data phase. Zephyr only accepts a
+ * bit timing where core_clock % (prescaler * bitrate) == 0, and 5 Mbit/s is
+ * unreachable from the board's 24 MHz HSE, so take the FDCAN kernel clock from
+ * PCLK1 at 170 MHz as the pellet module board does. */
+&fdcan1 {
+	clocks = <&rcc STM32_CLOCK_BUS_APB1 0x02000000>,
+			 <&rcc STM32_SRC_PCLK FDCAN_SEL(1)>;
 };
 
 &dma1 {
@@ -172,6 +157,14 @@
 
 &dmamux1 {
 	status = "okay";
+};
+
+&timers2 {
+	status = "okay";
+};
+
+&pwm2 {
+	status = "disabled";
 };
 
 &timers3 {
@@ -186,14 +179,14 @@
 };
 
 &timers4 {
-  st,prescaler = <84>; // 170 MHz / (84 + 1) = 2 MHz
-  status = "okay";
+	st,prescaler = <84>; // 170 MHz / (84 + 1) = 2 MHz
+	status = "okay";
 
-  pwm4: pwm {
-    status = "okay";
-    pinctrl-0 = <&tim4_ch1_pb6  &tim4_ch2_pb7>;
-    pinctrl-names = "default";
-  };
+	pwm4: pwm {
+		status = "okay";
+		pinctrl-0 = <&tim4_ch1_pb6 &tim4_ch2_pb7>;
+		pinctrl-names = "default";
+	};
 };
 
 &timers5 {
@@ -261,10 +254,8 @@
 		pinctrl-0 = <&tim1_ch3_pc2>;
 		pinctrl-names = "default";
 
-		// Direction Pin
 		dir-gpios = <&gpioc 3 GPIO_ACTIVE_HIGH>;
 
-		// PWM Channel to use
 		pwm-channel = <3>;
 
 		dmas = <&dmamux1 3 46 STM32_DMA_PRIORITY_MEDIUM>;
@@ -286,10 +277,8 @@
 		pinctrl-0 = <&tim8_ch4_pc9>;
 		pinctrl-names = "default";
 
-		// Direction Pin
 		dir-gpios = <&gpioc 6 GPIO_ACTIVE_HIGH>;
 
-		// PWM Channel to use
 		pwm-channel = <4>;
 
 		dmas = <&dmamux1 4 53 STM32_DMA_PRIORITY_MEDIUM>;
@@ -311,10 +300,8 @@
 		pinctrl-0 = <&tim20_ch3_pc8>;
 		pinctrl-names = "default";
 
-		// Direction Pin
 		dir-gpios = <&gpioc 7 GPIO_ACTIVE_HIGH>;
 
-		// PWM Channel to use
 		pwm-channel = <3>;
 
 		dmas = <&dmamux1 5 90 STM32_DMA_PRIORITY_MEDIUM>;
@@ -325,124 +312,14 @@
 	};
 };
 
-&spi3 {
-	pinctrl-0 = <&spi3_nss_pa15 &spi3_sck_pc10
-				 &spi3_miso_pc11 &spi3_mosi_pc12>;
-	pinctrl-names = "default";
-	status = "okay";
-
-	flash1: external_flash@0 {
-		status = "okay";
-		compatible = "jedec,spi-nor";
-		reg = <0>;
-		spi-max-frequency = <4000000>;
-		size = <0x8000000>;
-		has-dpd;
-		t-enter-dpd = <3000>;
-		t-exit-dpd = <30000>;
-		jedec-id = [ef 40 15]; // For W25Q16JV
-
-		partitions {
-			compatible = "fixed-partitions";
-			#address-cells = <1>;
-			#size-cells = <1>;
-
-			slot1_partition: partition@0 {
-				label = "image-1";
-				reg = <0x00000000 DT_SIZE_K(444)>;
-			};
-
-			scratch_partition: partition@80000 {
-				label = "scratch";
-				reg = <0x00080000 DT_SIZE_K(512)>;
-			};
-
-			/* Create 64Kb of storage for settings */
-			storage_partition: partition@10000 {
-				label = "storage";
-				reg = <0x0010000 DT_SIZE_K(64)>;
-			};
-		};
-	};
-};
-
-&flash0 {
-	partitions {
-		compatible = "fixed-partitions";
-		#address-cells = <1>;
-		#size-cells = <1>;
-
-		boot_partition: partition@0 {
-			label = "mcuboot";
-			reg = <0x00000000 DT_SIZE_K(64)>;
-		};
-
-		slot0_partition: partition@10000 {
-			label = "image-0";
-			reg = <0x00010000 DT_SIZE_K(444)>;
-		};
-
-	};
-};
-
-&usb {
-	pinctrl-0 = <&usb_dm_pa11 &usb_dp_pa12>;
-	pinctrl-names = "default";
-	status = "okay";
-
-	cdc_acm_uart0: cdc_acm_uart0 {
-		compatible = "zephyr,cdc-acm-uart";
-		status = "okay";
-	};
-};
-
-&iwdg {
-	status = "okay";
-};
-
-&rng {
-	status = "okay";
-};
-
-&dac1 {
-	pinctrl-0 = <&dac1_out1_pa4>;
-	pinctrl-names = "default";
-	status = "okay";
-};
-
-&dac2 {
-	pinctrl-0 = <&dac2_out1_pa6>;
-	pinctrl-names = "default";
-	status = "okay";
-};
-
-&die_temp {
-	status = "okay";
-};
-
-&fdcan3 {
-	clocks = <&rcc STM32_CLOCK_BUS_APB1 0x02000000>,
-			 <&rcc STM32_SRC_PCLK FDCAN_SEL(1)>;
-	pinctrl-0 = <&fdcan3_rx_pb3 &fdcan3_tx_pb4>;
-	pinctrl-names = "default";
-	status = "okay";
-};
-
-&vref {
-	status = "okay";
-};
-
-&vbat {
-	status = "okay";
-};
-
-&usart2 {
+/* The pellet module talks to the TMC2209s on USART2; that one is the ST-LINK
+ * virtual COM port here, so the drivers move to USART1 on the Arduino D0/D1 pins. */
+&usart1 {
 	current-speed = <230400>;
-	/delete-property/ hw-flow-control;
 	parity = "none";
 	stop-bits = "1";
 	data-bits = <8>;
-	pinctrl-0 = <&usart2_tx_pa2 &usart2_rx_pa3>;
+	pinctrl-0 = <&usart1_tx_pc4 &usart1_rx_pc5>;
 	pinctrl-names = "default";
 	#size-cells = <0>;
 	#address-cells = <1>;
@@ -466,26 +343,23 @@
 		reg = <0x02>;
 		status = "okay";
 	};
-
-	stepper_dummy: stepper_dummy@3 {
-		// This is a dummy device, not connected on this board, for verifying
-		// UART transactions via a logic analyzer if `status` is set
-		// to `okay`.
-		compatible = "adi,tmc2209";
-		reg = <0x03>;
-		status = "disabled";
-	};
 };
 
-// Configure pull-downs for the stepper motor STEP pins
-&tim20_ch3_pc8 {
-	bias-pull-down;
+&dac2 {
+	pinctrl-0 = <&dac2_out1_pa6>;
+	pinctrl-names = "default";
+	status = "okay";
 };
 
+/* Pull-downs on the stepper STEP pins, as on the pellet module. */
 &tim1_ch3_pc2 {
 	bias-pull-down;
 };
 
 &tim8_ch4_pc9 {
+	bias-pull-down;
+};
+
+&tim20_ch3_pc8 {
 	bias-pull-down;
 };
