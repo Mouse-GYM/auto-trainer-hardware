@@ -1,0 +1,383 @@
+name: CI
+
+# Temporarily disabled for automatic events. Restore the pull_request and push
+# triggers when the checks and firmware builds should run automatically again.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      formatting: ${{ steps.filter.outputs.formatting }}
+      firmware: ${{ steps.filter.outputs.firmware }}
+      libjerrycan: ${{ steps.filter.outputs.libjerrycan }}
+      jerrycan_updater: ${{ steps.filter.outputs.jerrycan_updater }}
+      whiskerwire: ${{ steps.filter.outputs.whiskerwire }}
+      pellet_hardware: ${{ steps.filter.outputs.pellet_hardware }}
+      magnet_hardware: ${{ steps.filter.outputs.magnet_hardware }}
+      jetson_hardware: ${{ steps.filter.outputs.jetson_hardware }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            formatting:
+              - 'firmware/**'
+              - 'docker/**'
+            firmware:
+              - 'firmware/**'
+              - 'docker/**'
+            libjerrycan:
+              - 'software/libjerrycan/**'
+              - 'docker/pybind11/**'
+            jerrycan_updater:
+              - 'software/jerrycan_updater/**'
+              - 'docker/pybind11/**'
+            whiskerwire:
+              - 'software/whiskerwire/**'
+              - 'docker/pybind11/**'
+            pellet_hardware:
+              - 'hardware/pellet_module/**'
+            magnet_hardware:
+              - 'hardware/magnet_module/**'
+            jetson_hardware:
+              - 'hardware/jetson_breakout/**'
+
+  formatting:
+    name: Check firmware formatting
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.formatting == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/mouse-gym/auto-trainer-hardware/code-format:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out pull-request head
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Check formatting against the base branch
+        run: |
+          git fetch origin "${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+          git-clang-format -v --commit "origin/${GITHUB_BASE_REF}" -q --diff -- firmware
+
+  firmware:
+    name: Firmware (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.firmware == 'true' || github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pellet-module
+            module: pellet_module
+            board: cerebellumlab_pellet_module
+            mcuboot: true
+            artifact: release-firmware-pellet-module
+          - name: pellet-module-nucleo-g474re
+            module: pellet_module
+            board: nucleo_g474re
+            mcuboot: false
+            artifact: ci-firmware-pellet-module-nucleo-g474re
+          - name: magnet-module
+            module: magnet_module
+            board: cerebellumlab_magnet_module
+            mcuboot: true
+            artifact: release-firmware-magnet-module
+    container:
+      image: ghcr.io/mouse-gym/auto-trainer-hardware/zephyr-sdk:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Restore West dependencies
+        uses: actions/cache@v6
+        with:
+          path: deps
+          key: zephyr-deps-${{ hashFiles('firmware/west.yml') }}
+
+      - name: Build firmware
+        env:
+          BOARD: ${{ matrix.board }}
+          MCUBOOT: ${{ matrix.mcuboot }}
+          MODULE: ${{ matrix.module }}
+        run: |
+          cd firmware
+          west init -l
+          west update
+          cd "${MODULE}"
+          west build -p --sysbuild -b "${BOARD}"
+
+          GIT_DESCRIBE="$(git describe --tags --always --dirty)"
+          if [[ "${MCUBOOT}" == "true" ]]; then
+            cp "build/${MODULE}/zephyr/zephyr.signed.hex" "../${MODULE}_fw_${GIT_DESCRIBE}.hex"
+            cp "build/${MODULE}/zephyr/zephyr.signed.bin" "../${MODULE}_fw_${GIT_DESCRIBE}.bin"
+            cp build/mcuboot/zephyr/zephyr.hex "../${MODULE}_${GIT_DESCRIBE}_bootloader.hex"
+            cp build/mcuboot/zephyr/zephyr.bin "../${MODULE}_${GIT_DESCRIBE}_bootloader.bin"
+          else
+            cp "build/${MODULE}/zephyr/zephyr.hex" "../${MODULE}_${BOARD}_fw_${GIT_DESCRIBE}.hex"
+            cp "build/${MODULE}/zephyr/zephyr.bin" "../${MODULE}_${BOARD}_fw_${GIT_DESCRIBE}.bin"
+          fi
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            firmware/*.hex
+            firmware/*.bin
+          if-no-files-found: error
+
+  pyjerrycan:
+    name: PyJerryCAN (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.libjerrycan == 'true' || github.ref_type == 'tag'
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            runner: '["ubuntu-latest"]'
+            image: ghcr.io/mouse-gym/auto-trainer-hardware/pybind11:latest
+          - platform: arm64
+            runner: '["self-hosted", "Linux", "ARM64"]'
+            image: ghcr.io/mouse-gym/auto-trainer-hardware/pyjerrycan-arm:latest
+    container:
+      image: ${{ matrix.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Build wheel
+        working-directory: software/libjerrycan
+        run: pip3 wheel . -w "${GITHUB_WORKSPACE}/wheels"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-pyjerrycan-${{ matrix.platform }}
+          path: wheels/pyjerrycan*.whl
+          if-no-files-found: error
+
+  jerrycan-updater:
+    name: JerryCAN updater (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.jerrycan_updater == 'true' || github.ref_type == 'tag'
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            runner: '["ubuntu-latest"]'
+          - platform: arm64
+            runner: '["self-hosted", "Linux", "ARM64"]'
+    container:
+      image: ghcr.io/mouse-gym/auto-trainer-hardware/pybind11:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Build updater
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          GIT_DESCRIBE="$(git describe --tags --always --dirty)"
+          cmake -B build -DCMAKE_INSTALL_PREFIX:PATH=../tmp -GNinja
+          ninja -C build jerrycan_updater
+          mkdir -p host_tools
+          cp build/software/jerrycan_updater/jerrycan_updater "host_tools/jerrycan_updater_${GIT_DESCRIBE}_${PLATFORM}"
+
+      - name: Upload updater
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-jerrycan-updater-${{ matrix.platform }}
+          path: host_tools/jerrycan_updater_*
+          if-no-files-found: error
+
+  whiskerwire:
+    name: WhiskerWire wheel
+    needs: changes
+    if: needs.changes.outputs.whiskerwire == 'true' || github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/mouse-gym/auto-trainer-hardware/pybind11:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Build wheel
+        working-directory: software/whiskerwire
+        run: pip3 wheel ../libjerrycan . -w "${GITHUB_WORKSPACE}/wheels"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-whiskerwire
+          path: wheels/whiskerwire*.whl
+          if-no-files-found: error
+
+  hardware-diffs:
+    name: Hardware diff (${{ matrix.name }})
+    needs: changes
+    if: >-
+      github.event_name == 'pull_request' &&
+      (needs.changes.outputs.pellet_hardware == 'true' ||
+       needs.changes.outputs.magnet_hardware == 'true' ||
+       needs.changes.outputs.jetson_hardware == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pellet-module
+            change_output: pellet_hardware
+            project_dir: hardware/pellet_module
+            project_file: pellet.kicad_pro
+          - name: magnet-module
+            change_output: magnet_hardware
+            project_dir: hardware/magnet_module
+            project_file: magnet.kicad_pro
+          - name: jetson-breakout
+            change_output: jetson_hardware
+            project_dir: hardware/jetson_breakout
+            project_file: jetson_breakout.kicad_pro
+    container:
+      image: leoheck/kiri:latest
+      options: --user root
+    env:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/kiri/.local/share/kiri/bin:/home/kiri/.local/share/kiri/submodules/KiCad-Diff/bin:/home/kiri/bin
+      TERM: xterm
+    steps:
+      - name: Check out pull-request head
+        if: needs.changes.outputs[matrix.change_output] == 'true'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install comment dependencies
+        if: needs.changes.outputs[matrix.change_output] == 'true'
+        run: apt-get update && apt-get install -y curl jq
+
+      - name: Generate hardware diff
+        if: needs.changes.outputs[matrix.change_output] == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PROJECT_DIR: ${{ matrix.project_dir }}
+          PROJECT_FILE: ${{ matrix.project_file }}
+        run: |
+          kiri --no-server -o "$(git rev-parse --short "${BASE_SHA}")" "${PROJECT_DIR}/${PROJECT_FILE}"
+
+      - name: Upload hardware diff
+        if: needs.changes.outputs[matrix.change_output] == 'true'
+        id: hardware_diff
+        uses: actions/upload-artifact@v7
+        with:
+          name: hardware-diff-${{ matrix.name }}
+          path: ${{ matrix.project_dir }}/.kiri
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Comment with artifact link
+        if: >-
+          needs.changes.outputs[matrix.change_output] == 'true' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          ARTIFACT_URL: ${{ steps.hardware_diff.outputs.artifact-url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PROJECT_DIR: ${{ matrix.project_dir }}
+        run: |
+          jq -n \
+            --arg body "Board diff for ${PROJECT_DIR}: [download the generated artifact](${ARTIFACT_URL})" \
+            '{body: $body}' > /tmp/hardware-diff-comment.json
+          curl --fail-with-body --location \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            --data-binary @/tmp/hardware-diff-comment.json \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments"
+
+  release:
+    name: Create GitHub release
+    needs:
+      - firmware
+      - pyjerrycan
+      - jerrycan-updater
+      - whiskerwire
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify release assets
+        run: find release -maxdepth 1 -type f -print
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "CI/CD Release ${GITHUB_REF_NAME}" \
+            --notes "CI/CD Release ${GITHUB_REF_NAME}"

@@ -1,13 +1,13 @@
 #
 # Build a Docker image with clang-format
 # Update the container image by running:
-# $ docker buildx build -t registry.gitlab.leaflabs.com/cuanschutz/autotrainer/code-format .
+# $ docker buildx build -t ghcr.io/mouse-gym/auto-trainer-hardware/code-format .
 #
 # Update the container registry by running:
-# $ docker push registry.gitlab.leaflabs.com/cuanschutz/autotrainer/code-format
+# $ docker push ghcr.io/mouse-gym/auto-trainer-hardware/code-format
 #
 
-FROM ubuntu as build
+FROM ubuntu AS build
 
 RUN apt update && \
     apt install -y git cmake build-essential python3

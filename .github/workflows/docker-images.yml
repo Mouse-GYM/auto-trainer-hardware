@@ -1,0 +1,163 @@
+name: Publish Docker images
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "docker/**"
+      - ".github/workflows/docker-images.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAMESPACE: ghcr.io/mouse-gym/auto-trainer-hardware
+
+concurrency:
+  group: docker-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.image }} (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: code-format
+            context: docker/code-format
+            architecture: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - image: pybind11
+            context: docker/pybind11
+            architecture: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - image: pybind11
+            context: docker/pybind11
+            architecture: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - image: pyjerrycan-arm
+            context: docker/pyjerrycan-arm
+            architecture: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - image: zephyr-sdk
+            context: docker/zephyr-sdk
+            architecture: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - image: zephyr-sdk
+            context: docker/zephyr-sdk
+            architecture: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish platform image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.architecture }}
+
+      - name: Save image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish ${{ matrix.image }} manifest
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: code-format
+          - image: pybind11
+          - image: pyjerrycan-arm
+          - image: zephyr-sdk
+
+    steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+
+      - name: Create and publish image manifest
+        env:
+          DIGESTS_DIR: ${{ runner.temp }}/digests
+          IMAGE: ${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          TAGS: ${{ steps.metadata.outputs.tags }}
+        run: |
+          digest_args=()
+          while IFS= read -r digest_file; do
+            digest_args+=("${IMAGE}@sha256:$(basename "${digest_file}")")
+          done < <(find "${DIGESTS_DIR}" -maxdepth 1 -type f -print | sort)
+
+          tag_args=()
+          while IFS= read -r tag; do
+            tag_args+=(--tag "${tag}")
+          done <<< "${TAGS}"
+
+          docker buildx imagetools create "${tag_args[@]}" "${digest_args[@]}"
+
+      - name: Inspect published image
+        run: docker buildx imagetools inspect "${IMAGE_NAMESPACE}/${{ matrix.image }}:${{ steps.metadata.outputs.version }}"

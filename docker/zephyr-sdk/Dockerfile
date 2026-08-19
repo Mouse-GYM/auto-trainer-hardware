@@ -1,13 +1,15 @@
 #
 # Build a Docker image with tools to build a zephyr firmware image
 # Update the container image by running:
-# $ docker buildx build -t registry.gitlab.leaflabs.com/cuanschutz/autotrainer/zephyr-sdk .
+# $ docker buildx build --platform linux/arm64,linux/amd64 -t ghcr.io/mouse-gym/auto-trainer-hardware/zephyr-sdk --push .
 #
-# Update the container registry by running:
-# $ docker push registry.gitlab.leaflabs.com/cuanschutz/autotrainer/zephyr-sdk
+# The command above publishes both platform images and their shared manifest.
 #
 
-FROM ubuntu as build
+FROM ubuntu:22.04 AS build
+
+ARG TARGETARCH
+ARG ZEPHYR_SDK_VERSION=0.16.8
 
 RUN apt update && \
     DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
@@ -29,13 +31,17 @@ RUN apt update && \
     libpython3-dev \
     make \
     gcc \
-    gcc-multilib \
-    g++-multilib \
     libsdl2-dev \
     libmagic1 \
     protobuf-compiler \
     build-essential \
-    python3-pyelftools
+    python3-pyelftools && \
+    if [ "${TARGETARCH}" = "amd64" ]; then \
+        DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+        gcc-multilib \
+        g++-multilib; \
+    fi && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install \
     west \
@@ -46,11 +52,15 @@ RUN python3 -m pip install \
     cbor \
     intelhex
 
-RUN cd /opt && \
-    wget https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.16.8/zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz && \
-    tar xf zephyr-sdk-*.tar.xz && \
-    rm -f zephyr-sdk-*.tar.xz && \
-    cd zephyr-sdk-* && \
+RUN case "${TARGETARCH}" in \
+        amd64) sdk_arch=x86_64 ;; \
+        arm64) sdk_arch=aarch64 ;; \
+        *) echo "Unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    sdk_archive="zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-${sdk_arch}_minimal.tar.xz" && \
+    cd /opt && \
+    wget "https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZEPHYR_SDK_VERSION}/${sdk_archive}" && \
+    tar xf "${sdk_archive}" && \
+    rm -f "${sdk_archive}" && \
+    cd "zephyr-sdk-${ZEPHYR_SDK_VERSION}" && \
     ./setup.sh -t arm-zephyr-eabi -c -h
-
-
