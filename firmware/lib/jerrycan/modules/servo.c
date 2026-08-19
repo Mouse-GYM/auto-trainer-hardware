@@ -60,8 +60,6 @@ static int servo_handler(const jerrycan_msg_t *msg) {
     if (!context) {
         rc = -ENOENT;
     } else {
-        context->uuid = msg->uuid;
-
         switch (msg->servo_move.abs_or_rel) {
             case JERRYCAN_MOVE_ABSOLUTE:
                 // Move the servo to the absolute position
@@ -83,6 +81,8 @@ static int servo_handler(const jerrycan_msg_t *msg) {
     }
 
     if (rc == 0) {
+        // only retain/associate uuid with context if command was accepted
+        context->uuid = msg->uuid;
         rc = COMMAND_NOT_COMPLETE;
     }
 

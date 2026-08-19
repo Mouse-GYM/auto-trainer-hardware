@@ -74,15 +74,14 @@ static int stepper_move_handler(const jerrycan_msg_t *msg) {
         return -ENODEV;
     }
 
-    context->uuid = msg->uuid;
+    int rc;
 
     if (move->save) {
         stepper_save_fixed_location(context, move->motor_id, move->position, move->abs_or_rel == JERRYCAN_MOVE_ABSOLUTE);
-        return 0;
+        rc = 0;
     } else {
         moving_state = MOVING_SINGLE;
 
-        int rc = -1;
         switch (msg->stepper_move.abs_or_rel) {
             case JERRYCAN_MOVE_ABSOLUTE:
                 // Move the stepper to the absolute position
@@ -96,10 +95,16 @@ static int stepper_move_handler(const jerrycan_msg_t *msg) {
 
             default:
                 LOG_ERR("Invalid move type: %d", msg->stepper_move.abs_or_rel);
+                rc = -1;
         }
 
-        return (rc == 0) ? COMMAND_NOT_COMPLETE : rc;
+        if (rc == 0) {
+            // only retain/associate uuid with context if command was accepted
+            context->uuid = msg->uuid;
+            rc = COMMAND_NOT_COMPLETE;
+        }
     }
+    return rc;
 }
 
 static jerrycan_rx_callback_t stepper_callback = {
@@ -123,13 +128,22 @@ static int get_motor_id_for_state(moving_state_t state) {
     }
 }
 
-static void set_uuid_for_xyz_context(uint8_t uuid) {
+static int set_uuid_for_xyz_context(uint8_t uuid) {
+    // check all are free before
     for (int motor_id = 0; motor_id < 3; motor_id++) {
         const struct device *dev = stepper_motor_by_id(motor_id);
         struct stepper_work_context *context = find_stepper_context_from_device(dev);
-
+        if (context->motion_mode == MOTION_IN_PROGESS) {
+            return -EBUSY;
+        }
+    }
+    // and only then assign uuid:
+    for (int motor_id = 0; motor_id < 3; motor_id++) {
+        const struct device *dev = stepper_motor_by_id(motor_id);
+        struct stepper_work_context *context = find_stepper_context_from_device(dev);
         context->uuid = uuid;
     }
+    return 0;
 }
 
 static bool attempt_motor_move(int motor_id) {
@@ -221,10 +235,12 @@ static void stepper_handle_fixed_sequence() {
 }
 
 static int stepper_fixed_move(const jerrycan_msg_t *msg) {
-    set_uuid_for_xyz_context(msg->uuid);
-    moving_state = MOVE_X;
+    int rc = set_uuid_for_xyz_context(msg->uuid);
+    if (rc == 0) {
+        moving_state = MOVE_X;
+    }
 
-    return COMMAND_NOT_COMPLETE;
+    return rc == 0 ? COMMAND_NOT_COMPLETE : rc;
 }
 
 static jerrycan_rx_callback_t stepper_fixed_callback = {
@@ -320,9 +336,10 @@ static int stepper_home_handler(const jerrycan_msg_t *msg) {
         LOG_INF("Homing motor %d with UUID=%d", msg->stepper_home.motor_id, msg->uuid);
         moving_state = MOVING_SINGLE;
 
-        context->uuid = msg->uuid;
-
         rc = stepper_home(dev);
+        if (rc == 0) {
+            context->uuid = msg->uuid;
+        }
     }
 
     return rc == 0 ? COMMAND_NOT_COMPLETE : rc;
