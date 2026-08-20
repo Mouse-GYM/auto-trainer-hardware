@@ -99,11 +99,17 @@ int ll_motor_start_dma(const struct device *dev) {
         return ret;
     }
 
-    // Generate an update to fetch the first value via DMA
-    LL_TIM_GenerateEvent_UPDATE(cfg->timer);
+    /* Only kick a stopped timer. A running one generates its own update events, and forcing one
+     * here resets CNT mid-period: in PWM1 mode that re-starts an in-progress high phase instead of
+     * ending it, emitting a single pulse of up to twice the intended width. On a servo that is a
+     * visible jump forward for one 20 ms frame. The stepper reaches this path with the counter
+     * already disabled by `stop_on_dma_complete`, so it still gets its initial value promptly. */
+    if (!LL_TIM_IsEnabledCounter(cfg->timer)) {
+        // Generate an update to fetch the first value via DMA
+        LL_TIM_GenerateEvent_UPDATE(cfg->timer);
 
-    // Enable the counter
-    LL_TIM_EnableCounter(cfg->timer);
+        LL_TIM_EnableCounter(cfg->timer);
+    }
 
     return 0;
 }
