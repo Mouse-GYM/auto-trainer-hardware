@@ -354,12 +354,13 @@ static void servo_motor_event_callback(const struct device *const dev, ll_motor_
 
 void stepper_cancel_all_work(const struct device *dev) {
     struct stepper_work_context *context = find_stepper_context_from_device(dev);
+    if (context == NULL) {
+        return;
+    }
+
+    context->motion_mode = MOTION_DONE;
     k_work_cancel_delayable(&context->calculation_work);
     k_work_cancel_delayable(&context->check_driver_work);
-
-    if (context->motion_mode == MOTION_IN_PROGESS) {
-        context->motion_mode = MOTION_DONE;
-    }
 }
 
 void servo_cancel_all_work(const struct device *dev) {
@@ -419,6 +420,11 @@ static void stepper_work_calculation_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct stepper_work_context *context = CONTAINER_OF(dwork, struct stepper_work_context, calculation_work);
 
+    // Cancellation is asynchronous, so a handler that was already running must stop itself.
+    if (context->motion_mode != MOTION_IN_PROGESS) {
+        return;
+    }
+
     switch (context->move_control) {
         default:
         case MOVING_POSITION: {
@@ -439,7 +445,7 @@ static void stepper_work_calculation_handler(struct k_work *work) {
 
             // Add the buffer onto the stepper driver queue
             LOG_DBG("Q buf %d [%p]", context->current_buffer, (void *)context->buffers[context->current_buffer]);
-            if (ret > 0) {
+            if (ret > 0 && context->motion_mode == MOTION_IN_PROGESS) {
                 // Sending a buffer of length 0 here causes the event callbacks
                 // to function a little weirdly.
                 ll_queue_stepper_positions(context->dev, context->buffers[context->current_buffer],
@@ -455,8 +461,10 @@ static void stepper_work_calculation_handler(struct k_work *work) {
             context->last_calculation_ret = ret;
 
             LOG_DBG("Q buf %d [%p]", context->current_buffer, (void *)context->buffers[context->current_buffer]);
-            ll_queue_stepper_positions(context->dev, context->buffers[context->current_buffer],
-                                       context->last_calculation_ret * sizeof(uint32_t), K_FOREVER);
+            if (context->motion_mode == MOTION_IN_PROGESS) {
+                ll_queue_stepper_positions(context->dev, context->buffers[context->current_buffer],
+                                           context->last_calculation_ret * sizeof(uint32_t), K_FOREVER);
+            }
 
             context->current_buffer = (context->current_buffer + 1) % BUFS_PER_MOTOR;
         } break;

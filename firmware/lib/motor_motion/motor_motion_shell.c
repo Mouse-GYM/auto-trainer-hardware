@@ -338,7 +338,6 @@ static int cmd_stepper_stop(const struct shell *shell, size_t argc, char **argv)
     }
 
     stepper_motor_stop(stepper_dev);
-    stepper_cancel_all_work(stepper_dev);
     return 0;
 }
 

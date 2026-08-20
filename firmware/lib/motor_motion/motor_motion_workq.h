@@ -54,7 +54,7 @@ struct stepper_work_context {
     atomic_flag e_stop_triggered;
     _Atomic movement_control_t move_control;
     _Atomic ll_stepper_dir_t motor_direction;
-    motion_mode_t motion_mode;
+    _Atomic motion_mode_t motion_mode;
     bool motion_calculation_done;
     struct k_work_delayable calculation_work;
     struct k_work_delayable check_driver_work;
