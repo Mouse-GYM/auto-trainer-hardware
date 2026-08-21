@@ -128,7 +128,7 @@ static int get_motor_id_for_state(moving_state_t state) {
     }
 }
 
-static int set_uuid_for_xyz_context(uint8_t uuid) {
+static int set_uuid_for_xyz_context(const uint8_t uuid) {
     // check all are free before
     for (int motor_id = 0; motor_id < 3; motor_id++) {
         const struct device *dev = stepper_motor_by_id(motor_id);
