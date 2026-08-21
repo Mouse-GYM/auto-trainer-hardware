@@ -35,7 +35,7 @@
 
 LOG_MODULE_DECLARE(jerrycan, CONFIG_LIB_JERRYCAN_LOG_LEVEL);
 
-void jerrycan_status_tx() {
+void jerrycan_status_tx(struct k_timer *timer) {
     // Send a status message
     // FIXME: TODO: Actually read the status of the motors and sensors and populate this message
 #if 0
@@ -67,11 +67,17 @@ static struct _delay {
     uint8_t uuid;
 } delay_data;
 
-static void status_delay_expired() { jerrycan_send_ack(delay_data.uuid, 0); }
+static void status_delay_expired(struct k_timer *timer) {
+    jerrycan_send_ack(delay_data.uuid, 0);
+    delay_data.uuid = 0;
+}
 
 K_TIMER_DEFINE(delay_timer, status_delay_expired, NULL);
 
 static int status_delay(const jerrycan_msg_t *msg) {
+    if (delay_data.uuid) {
+        return -EBUSY;
+    }
     delay_data.uuid = msg->uuid;
     k_timer_start(&delay_timer, K_MSEC(msg->delay.delay), K_MSEC(0));
 
