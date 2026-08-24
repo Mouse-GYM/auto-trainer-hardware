@@ -86,11 +86,11 @@ static int jerrycan_load_cell_tare_handler(const jerrycan_msg_t *msg) {
 
         if (msg->load_cell_tare.instance == instance_number) {
             rc = ll_load_cell_tare(load_cell);
-
             if (rc < 0) {
                 LOG_ERR("Failed to perform the requested load cell tare operation: %d", rc);
             } else {
                 LOG_INF("Successfully tared load_cell%d", instance_number);
+                rc = 0;  // ensure we return rc == 0 for the uuid ack error field.
             }
             break;
         }
