@@ -238,9 +238,9 @@ static int stepper_fixed_move(const jerrycan_msg_t *msg) {
     int rc = set_uuid_for_xyz_context(msg->uuid);
     if (rc == 0) {
         moving_state = MOVE_X;
+        return COMMAND_NOT_COMPLETE;
     }
-
-    return rc == 0 ? COMMAND_NOT_COMPLETE : rc;
+    return rc;
 }
 
 static jerrycan_rx_callback_t stepper_fixed_callback = {
