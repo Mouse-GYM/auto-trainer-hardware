@@ -75,21 +75,30 @@ static int ll_microphone_initialize(const struct device* device) {
 /* -------------------------------------------------------------------------- */
 
 bool ll_microphone_enable_reads(const struct device* device, const bool enable) {
+    int ret;
     microphone_data_t* mic = device->data;
 
     if (!mic->initialized) {
         static bool reported = false;
         if (!reported) {
-            LOG_ERR("Must initialize the microphone entity before calling mic_enable_reads\n");
+            LOG_ERR("Must initialize the microphone entity before calling mic_enable_reads");
             reported = true;
         }
         return false;
     }
 
-    const int ret = i2s_trigger(mic->i2sDevice, I2S_DIR_RX, enable ? I2S_TRIGGER_START : I2S_TRIGGER_STOP);
+    if (enable) {
+        ret = i2s_trigger(mic->i2sDevice, I2S_DIR_RX, I2S_TRIGGER_PREPARE);
+        if (ret < 0) {
+            LOG_ERR("Failed to prepare streaming: %d", ret);
+            mic->streamEnabled = false;
+            return false;
+        }
+    }
 
+    ret = i2s_trigger(mic->i2sDevice, I2S_DIR_RX, enable ? I2S_TRIGGER_START : I2S_TRIGGER_STOP);
     if (ret < 0) {
-        LOG_ERR("Failed to %sable streaming: %d\n", enable ? "en" : "dis", ret);
+        LOG_ERR("Failed to %sable streaming: %d", enable ? "en" : "dis", ret);
         mic->streamEnabled = false;
         return false;
     }
@@ -113,7 +122,7 @@ int ll_microphone_read(const struct device* device, void** mem_block, uint32_t* 
     if (!mic->initialized) {
         static bool reported = false;
         if (!reported) {
-            LOG_ERR("Must initialize the microphone entity before calling mic_read\n");
+            LOG_ERR("Must initialize the microphone entity before calling mic_read");
             reported = true;
         }
         return -ENOENT;
@@ -122,7 +131,7 @@ int ll_microphone_read(const struct device* device, void** mem_block, uint32_t* 
     if (!mic->streamEnabled) {
         static bool reported = false;
         if (!reported) {
-            LOG_ERR("Must enable reads before calling mic_read\n");
+            LOG_ERR("Must enable reads before calling mic_read");
             reported = true;
         }
 
@@ -153,6 +162,54 @@ int ll_microphone_channel_count(const struct device* device) {
     const microphone_cfg_t* config = device->config;
 
     return config->i2s_cfg.channels;
+}
+
+/* -------------------------------------------------------------------------- */
+
+int ll_microphone_reset_read(const struct device* device) {
+    // search for "zephyr i2s_read fails + recovery"
+    const microphone_data_t* mic = device->data;
+    const struct device* i2s_dev = mic->i2sDevice;
+    const microphone_cfg_t* config = device->config;
+    void* mem_block = NULL;
+    uint32_t block_size;
+    int ret;
+    // put port/stream to stop->drop:
+    ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_STOP);
+    if (ret < 0) {
+        LOG_ERR("Microphone Stop Failed. Bailing. ret=%d", ret);
+        return ret;
+    }
+    ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_DROP);
+    if (ret < 0) {
+        LOG_ERR("Microphone Drop Failed. Bailing. ret=%d", ret);
+        return ret;
+    }
+    // flush until EIO:
+    if (false) {  // unsure about this one
+        do {
+            ret = i2s_read(i2s_dev, &mem_block, &block_size);
+            if (ret == -EIO) {
+                break;
+            } else if (ret < 0) {
+                LOG_ERR("Error purging microphone buffer. Bailing. ret=%d", ret);
+                return ret;
+            }
+            k_mem_slab_free(config->i2s_cfg.mem_slab, mem_block);
+        } while (true);
+    }
+    // now re-prepare and start the stream:
+    ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_PREPARE);
+    if (ret < 0) {
+        LOG_ERR("Microphone Prepare Failed. Bailing. ret=%d", ret);
+        return ret;
+    }
+    ret = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START);
+    if (ret < 0) {
+        LOG_ERR("Microphone Start Failed. Bailing. ret=%d", ret);
+        return ret;
+    }
+    return 0;
 }
 
 /* -------------------------------------------------------------------------- */

@@ -159,7 +159,12 @@ static void audio_thread(void*, void*, void*) {
                 }
 
                 ll_microphone_release_buffer(microphone, rawData);
-
+            } else if (rc == -EIO) {
+                int ret = ll_microphone_reset_read(microphone);
+                if (ret != 0) {
+                    LOG_ERR("Microphone Reset Read Failed. Bailing");
+                    break;
+                }
             } else if (rc != -EAGAIN) {
                 LOG_ERR("Microphone Read Failed. Bailing");
                 break;
