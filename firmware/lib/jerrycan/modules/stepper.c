@@ -95,7 +95,7 @@ static int stepper_move_handler(const jerrycan_msg_t *msg) {
 
             default:
                 LOG_ERR("Invalid move type: %d", msg->stepper_move.abs_or_rel);
-                rc = -1;
+                rc = -EINVAL;
         }
 
         if (rc == 0) {
