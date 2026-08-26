@@ -102,6 +102,8 @@ static int stepper_move_handler(const jerrycan_msg_t *msg) {
             // only retain/associate uuid with context if command was accepted
             context->uuid = msg->uuid;
             rc = COMMAND_NOT_COMPLETE;
+        } else if (rc > 0) {
+            rc = 0;
         }
     }
     return rc;

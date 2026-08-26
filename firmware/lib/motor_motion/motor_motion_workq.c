@@ -725,8 +725,8 @@ int stepper_move_to_position(const struct device *dev, const float target_positi
     atomic_flag_clear(&context->e_stop_triggered);
 
     if (fabsf(target_position - context->context.last_position_generated) < 1.0f / context->microsteps) {
-        LOG_WRN("Target position is the same as current position.");
-        return -EAGAIN;
+        LOG_INF("Target position is the same as current position.");
+        return 1;
     }
 
     if (target_position < context->context.last_position_generated) {
