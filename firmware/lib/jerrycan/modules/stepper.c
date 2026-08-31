@@ -156,7 +156,7 @@ static bool attempt_motor_move(int motor_id) {
     const int rc = stepper_move_to_position(dev, context->fixed_position, context->motor_max_velocity,
                                             context->motor_max_acceleration);
 
-    if (rc < 0) {
+    if (rc != 0) {  // rc == 1 : already at position
         context->motion_mode = MOTION_DONE;
         return false;
     }
