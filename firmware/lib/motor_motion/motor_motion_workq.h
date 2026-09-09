@@ -9,6 +9,15 @@
 #include "stepper.h"
 
 /* ***** Struct Declarations and Defaults ***** */
+// Default pwm duration of the minimum angle
+#define SERVO_DEFAULT_MIN_ANGLE_PWM 1000.0f
+// Default pwm duration of the maximum angle
+#define SERVO_DEFAULT_MAX_ANGLE_PWM 2000.0f
+// Default minimum angle of servo
+#define SERVO_DEFAULT_MIN_ANGLE 0.0f
+// Default maximum angle of servo
+#define SERVO_DEFAULT_MAX_ANGLE SERVO_MAX_ALLOWED_ANGLE
+
 #define SERVO_BUFFER_SIZE 256
 #define STEPPER_BUFFER_SIZE 1024
 #define BUFS_PER_MOTOR 2
@@ -90,13 +99,23 @@ struct stepper_work_context {
  * These parameters are more constant than the positions so abstracted out here. If the `float`
  * parameters are lower than or equal to 0.0f, then those parameters are unchanged.
  *
+ * A non-finite argument is rejected outright — neither `NaN` nor `-Inf` is a usable value or a legitimate way
+ * to say "unchanged" — as is a positive pulse duration the timer cannot produce (see
+ * `SERVO_MAX_PULSE_DURATION_US`).
+ *
  * @retval -ENODEV if the device is not found among the static context structs.
+ * @retval -EINVAL if either pulse duration is non-finite or is a positive value out of range.
  */
 int servo_set_parameters(const struct device *dev, float max_velocity, float max_acceleration, float min_angle_pwm,
                          float max_angle_pwm);
 
 /*
- * Set the minimum and maximum angles of a servo. Both must be set at the same time.
+ * Set the minimum and maximum angles of a servo. Both must be set at the same time. The two are calibration
+ * endpoints rather than ordered bounds, so an inverted pair (`min > max`) is accepted; each must be finite and
+ * within `0..SERVO_MAX_ALLOWED_ANGLE` degrees, and a rejected pair leaves both fields at their previous values.
+ *
+ * @retval -ENODEV if the device is not found among the static context structs.
+ * @retval -EINVAL if either angle is out of range.
  */
 int servo_set_angle_parameters(const struct device *dev, const float min_angle, const float max_angle);
 
@@ -176,11 +195,18 @@ void servo_set_position_to_zero(const struct device *dev);
 void servo_assume_min_angle_position(struct servo_work_context *context);
 
 /*
- * Whether the servo's angle limits can be reasoned against at all: both finite and correctly ordered. Nothing
- * validates them on either install path — the settings loader passes `+Inf` through and the CAN cfg setter
- * checks nothing — so every reader that compares against or clamps to them has to ask first.
+ * Whether the servo's angle limits can be reasoned against at all: the two are calibration endpoints in either
+ * order, so this asks only whether both are finite and they describe a non-degenerate span. A stored record
+ * predating the load-path validation can still carry a non-finite or degenerate pair, so every reader that
+ * compares against or clamps to them has to ask first.
  */
 bool servo_angle_limits_usable(const struct servo_work_context *context);
+
+/*
+ * Whether `position` lies within the servo's configured travel, whichever of the two limits is the larger.
+ * False when the limits are not usable at all.
+ */
+bool servo_position_within_limits(const struct servo_work_context *context, float position);
 
 /*
  * Find the work contexts, given the device.

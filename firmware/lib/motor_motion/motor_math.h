@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -7,6 +8,16 @@
 #ifndef M_PI
 #define M_PI 3.1415927f
 #endif
+
+// Highest angle any servo may be configured or commanded to. The `max_angle` default, the settings fallback
+// and the calibration validation all derive from this one value.
+#define SERVO_MAX_ALLOWED_ANGLE 180.0f
+
+// A pulse this long fills the whole PWM period, so it cannot be produced: the driver sets ARR to
+// `SERVO_TIMER_PERIOD_COUNTS` (`firmware/drivers/motor/servo.c`) and a CCR above ARR never compares. Stated
+// in microseconds because that is what the calibration carries; the count-domain equivalence is asserted in
+// `motor_motion_workq.c`, which can see both this and the driver header.
+#define SERVO_MAX_PULSE_DURATION_US 20000.0f
 
 typedef struct motor_motion_profile {
     /* Parameters from the paper:
@@ -47,9 +58,9 @@ typedef struct servo_motor_context {
                              // variations, the time for the "minumum angle" is sometimes different
                              // from the actual nominal angle given above. For example, if the datasheet
                              // for a servo says that 1000us is the minimum signal correspond
-                             // to an angle of -90.0 degrees, but testing shows that at 1000us, the servo is
-                             // actually at -80.0 degrees, then set this to -80.0. The library will then
-                             // attempt to interpolate down to -90.0 degrees by adjusting the actual
+                             // to an angle of 0.0 degrees, but testing shows that at 1000us, the servo is
+                             // actually at 10.0 degrees, then set this to 10.0. The library will then
+                             // attempt to interpolate down to 0.0 degrees by adjusting the actual
                              // PWM.
 
     // PWM Parameters
@@ -57,6 +68,9 @@ typedef struct servo_motor_context {
     float max_angle_pwm;        // PWM pulse duration (in us) for the maximum angle
     float pwm_timer_increment;  // PWM pulse duration increment (in us) for each additional timer step
                                 // (1 / freq of timer peripheral). (Usually set by the devicetree.)
+    float pwm_per_degree;       // us of pulse width per degree, signed; negative for an inverted calibration.
+                                // Derived from the four calibration fields; 0 when the span cannot give a usable
+                                // slope. Never assign directly — see `motor_math.c`.
 
     // Servo-specific internal state
     float last_time_generated;      // In seconds
@@ -76,6 +90,35 @@ typedef struct stepper_motor_context {
     float last_time_generated;      // In seconds
     float last_position_generated;  // In revolutions
 } stepper_motor_context_t;
+
+/**
+ * Whether a single angle is one a servo may be configured or commanded to: finite and within
+ * `0..SERVO_MAX_ALLOWED_ANGLE` degrees.
+ */
+bool motor_motion_servo_angle_valid(float angle);
+
+/**
+ * Whether a single pulse duration is one the timer can produce: finite, non-negative and shorter than the PWM
+ * period (`SERVO_MAX_PULSE_DURATION_US`).
+ */
+bool motor_motion_servo_pwm_duration_valid(float duration_us);
+
+/**
+ * Whether both angle limits are individually valid. This is a range check on each field, not an ordering
+ * check: an inverted pair (`min > max`) and a degenerate pair (`min == max`) are both valid here.
+ */
+bool motor_motion_servo_angles_valid(float min_angle, float max_angle);
+
+/**
+ * Whether both calibration pulse durations are individually valid.
+ */
+bool motor_motion_servo_pwm_durations_valid(float min_angle_pwm, float max_angle_pwm);
+
+/**
+ * Convert an (actual) angle in degrees to the timer count that produces the corresponding pulse, using the
+ * servo's two-point calibration. Saturates at `0` and `UINT32_MAX` rather than performing an undefined cast.
+ */
+uint32_t motor_motion_servo_degrees_to_pwm_count(const servo_motor_context_t *context, float degree);
 
 /**
  * Initializes the context struct with the parameters from the paper.

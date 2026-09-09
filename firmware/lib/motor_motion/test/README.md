@@ -35,11 +35,24 @@ Use this helper script to graph the output:
 python3 graph_iters.py
 ```
 
-Profile a servo movement:
+Profile a servo movement across a 0-180 degree calibration:
 ```sh
-./motor_motion_test -p -s -a 1000 -v 10 -x -90 -y 90 -m -180 -M 180 -u 1000 -o 2000 >out.csv 
+./motor_motion_test -p -s -a 1000 -v 10 -x 0 -y 180 -m 0 -M 180 -u 1000 -o 2000 >out.csv
+```
+The two angle limits are calibration endpoints rather than ordered bounds, so an inverted calibration (the
+minimum angle at the longer pulse) profiles the same way:
+```sh
+./motor_motion_test -p -s -a 1000 -v 10 -x 90 -y 10 -m 90 -M 10 -u 200 -o 1200 >out.csv
 ```
 You may use the same script from above to graph it:
 ```sh
 python3 graph_stepper_or_servo.py
+```
+
+Self test
+===
+Check the angle-to-PWM mapping, the calibration predicates and a whole generated move without a servo
+attached. It prints each failing case to `stderr` and exits with the failure count:
+```sh
+build/motor_motion_test --selftest
 ```

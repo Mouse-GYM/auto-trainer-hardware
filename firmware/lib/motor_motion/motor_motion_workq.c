@@ -16,6 +16,11 @@
 
 LOG_MODULE_DECLARE(motor_motion, CONFIG_LIB_MOTOR_MOTION_LOG_LEVEL);
 
+// This is the only translation unit that sees both the library's microsecond ceiling and the driver's timer
+// period, so it is where the two are tied together.
+BUILD_ASSERT(SERVO_MAX_PULSE_DURATION_US == (float)SERVO_TIMER_PERIOD_COUNTS * 0.5f,
+             "The pulse-duration ceiling must match the driver's timer period at the 0.5 us servo count");
+
 /* ***** Forward Declaration of Callbacks ***** */
 #ifdef CONFIG_DT_HAS_LL_SERVO_ENABLED
 static void servo_motor_event_callback(const struct device *const dev, ll_motor_events_t event, void *arg,
@@ -29,14 +34,6 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
 
 /* ***** Static Context Structs Used Throughout ***** */
 
-// Default pwm duration of the minimum angle
-#define SERVO_DEFAULT_MIN_ANGLE_PWM 1000.0f
-// Default pwm duration of the maximum angle
-#define SERVO_DEFAULT_MAX_ANGLE_PWM 2000.0f
-// Default minimum angle of servo
-#define SERVO_DEFAULT_MIN_ANGLE 0.0f
-// Default maximum angle of servo
-#define SERVO_DEFAULT_MAX_ANGLE 180.0f
 // Default angular adjustment of servo
 #define SERVO_DEFAULT_ANGLE_ADJUSTMENT SERVO_DEFAULT_MIN_ANGLE
 // Default 'max_velocity' of servo
@@ -253,7 +250,17 @@ void servo_set_position_to_zero(const struct device *dev) {
 
 bool servo_angle_limits_usable(const struct servo_work_context *const context) {
     return context != NULL && isfinite(context->context.min_angle) && isfinite(context->context.max_angle) &&
-           context->context.min_angle <= context->context.max_angle;
+           context->context.min_angle != context->context.max_angle;
+}
+
+bool servo_position_within_limits(const struct servo_work_context *const context, const float position) {
+    if (!servo_angle_limits_usable(context)) {
+        return false;
+    }
+
+    const float low = MIN(context->context.min_angle, context->context.max_angle);
+    const float high = MAX(context->context.min_angle, context->context.max_angle);
+    return position >= low && position <= high;
 }
 
 void servo_assume_min_angle_position(struct servo_work_context *const context) {
@@ -261,8 +268,8 @@ void servo_assume_min_angle_position(struct servo_work_context *const context) {
         return;
     }
 
-    // `servo_set_angle_parameters` validates nothing, so a malformed cfg frame can leave a non-finite limit
-    // here; a NAN must never reach the belief fields, where the profile maths would propagate it.
+    // Both install paths now range-check the limits, but a NAN must never reach the belief fields — the
+    // profile maths would propagate it silently — so this stays as the last line of defence.
     const float position = isfinite(context->context.min_angle) ? context->context.min_angle : SERVO_DEFAULT_MIN_ANGLE;
 
     context->context.known_position = position;
@@ -555,11 +562,34 @@ SYS_INIT(motor_workq_init_and_start, APPLICATION, 99);
 /* ***** Initialize New Movements ***** */
 
 #define UNCHANGED_UINT32 ((uint32_t) - 1)
+
+/*
+ * A finite duration at or below zero means "leave this field alone" — `cmd_servo_set_physical_parameters`
+ * passes `-1` for both (`motor_motion_shell.c`). Anything above zero is a real calibration and has to be
+ * one the timer can produce. Non-finite is neither: `NaN` fails `> 0.0f` and `-Inf` is genuinely `<= 0`, so
+ * without this check both install nothing and report success.
+ */
+static bool servo_pwm_argument_usable(const float duration_us) {
+    if (!isfinite(duration_us)) {
+        return false;
+    }
+
+    return duration_us <= 0.0f || motor_motion_servo_pwm_duration_valid(duration_us);
+}
+
 int servo_set_parameters(const struct device *dev, const float max_velocity, const float max_acceleration,
                          const float min_angle_pwm, const float max_angle_pwm) {
     struct servo_work_context *const context = find_servo_context_from_device(dev);
     if (context == NULL) {
         return -ENODEV;
+    }
+
+    if (!servo_pwm_argument_usable(min_angle_pwm) || !servo_pwm_argument_usable(max_angle_pwm)) {
+        LOG_ERR(
+            "Rejected servo pulse durations [%f, %f]: each must be finite, and either below %f us or "
+            "non-positive to be left unchanged",
+            (double)min_angle_pwm, (double)max_angle_pwm, (double)SERVO_MAX_PULSE_DURATION_US);
+        return -EINVAL;
     }
 
     if (max_velocity > 0.0f) {
@@ -587,6 +617,12 @@ int servo_set_angle_parameters(const struct device *dev, const float min_angle, 
     struct servo_work_context *const context = find_servo_context_from_device(dev);
     if (context == NULL) {
         return -ENODEV;
+    }
+
+    if (!motor_motion_servo_angles_valid(min_angle, max_angle)) {
+        LOG_ERR("Rejected servo angle limits [%f, %f]: each must be finite and within 0..%f degrees", (double)min_angle,
+                (double)max_angle, (double)SERVO_MAX_ALLOWED_ANGLE);
+        return -EINVAL;
     }
 
     context->context.min_angle = min_angle;
@@ -625,21 +661,28 @@ int servo_move_to_position(const struct device *dev, float target_position, cons
     const float movement_max_a = MIN(context->motor_max_acceleration, max_acceleration);
     const float movement_max_v = MIN(context->motor_max_velocity, max_velocity);
 
-    // Limit position to within the desired angles
-    if (target_position < context->context.min_angle) {
-        target_position = context->context.min_angle;
-    } else if (target_position > context->context.max_angle) {
-        target_position = context->context.max_angle;
-    }
-
-    // Plan from the believed position. Bound it to the configured span so a host that narrows the limits after
-    // a real position was established cannot make the profile start outside the PWM endpoints — but only when
-    // the limits are usable: nothing validates them on either install path, and CLAMP with a non-finite or
-    // inverted pair yields NAN or a value outside both.
+    // Limit position to within the configured travel. The two limits are calibration endpoints, so either may
+    // be the larger one.
+    //
+    // The same pair bounds the believed position we plan from, so a host that narrows the limits after a real
+    // position was established cannot make the profile start outside the PWM endpoints.
+    //
+    // Finite is the whole condition, deliberately weaker than `servo_angle_limits_usable`: a degenerate pair is
+    // one `servo_set_angle_parameters` accepts, and it suppresses the slope to zero, so every angle maps to
+    // `min_angle_pwm` and the horn cannot move. Clamping to `low == high` pins both ends to that sole endpoint,
+    // which keeps the position the generator records — and the completion callback then persists — consistent
+    // with the pulse the servo actually receives. Skipping the clamp instead would let the profile advance the
+    // belief toward a target no pulse can express. `MIN`/`MAX` handle the inverted case, so only a non-finite
+    // limit, which would make CLAMP yield NAN, has to be excluded here.
     const float believed_position = context->context.last_position_generated;
-    const float start_position = servo_angle_limits_usable(context)
-                                     ? CLAMP(believed_position, context->context.min_angle, context->context.max_angle)
-                                     : believed_position;
+    float start_position = believed_position;
+
+    if (isfinite(context->context.min_angle) && isfinite(context->context.max_angle)) {
+        const float low = MIN(context->context.min_angle, context->context.max_angle);
+        const float high = MAX(context->context.min_angle, context->context.max_angle);
+        target_position = CLAMP(target_position, low, high);
+        start_position = CLAMP(believed_position, low, high);
+    }
 
     const int ret = motor_motion_servo_init_context_struct(start_position, target_position, movement_max_v,
                                                            movement_max_a, context->context.min_angle_pwm,

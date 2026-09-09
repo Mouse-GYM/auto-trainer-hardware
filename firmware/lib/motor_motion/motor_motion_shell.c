@@ -37,6 +37,16 @@ static int cmd_servo_set_pwm_parameters(const struct shell *shell, size_t argc, 
         return -EINVAL;
     }
 
+    // This command exists to install both durations, so neither argument can mean "unchanged". `0` satisfies
+    // the range rule but is indistinguishable from `servo_set_parameters`' sentinel once it gets there, so
+    // accepting it would report success for a command that changed nothing. The bound prints through `%d`
+    // because neither module's `prj.conf` enables `CONFIG_CBPRINTF_FP_SUPPORT`.
+    if (!motor_motion_servo_pwm_durations_valid(pwm_min_angle, pwm_max_angle) || pwm_min_angle <= 0.0f ||
+        pwm_max_angle <= 0.0f) {
+        shell_print(shell, "Pulse durations must be above 0 us and below %d us", (int)SERVO_MAX_PULSE_DURATION_US);
+        return -EINVAL;
+    }
+
     const int ret = servo_set_parameters(servo_dev, 0.0f, 0.0f, pwm_min_angle, pwm_max_angle);
     if (ret != 0) {
         shell_print(shell, "Failed to set servo parameters: %d", ret);

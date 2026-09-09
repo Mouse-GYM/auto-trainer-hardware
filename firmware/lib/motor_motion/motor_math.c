@@ -17,8 +17,6 @@ LOG_MODULE_DECLARE(motor_motion, CONFIG_LIB_MOTOR_MOTION_LOG_LEVEL);
 
 #define FE_ALL_BUT_INEXACT (FE_ALL_EXCEPT & ~FE_INEXACT)
 
-#define FULL_RANGE_IN_DEGREES 120  // per data sheet, physical movement to within 0..120 degrees.
-
 static void print_fp_error(const int errs) {
     if (errs & FE_DIVBYZERO) {
         LOG_ERR("Floating point error encountered: Division by zero");
@@ -88,6 +86,46 @@ static int motor_motion_init_context_struct(const float start, const float end, 
     return 0;
 }
 
+bool motor_motion_servo_angle_valid(const float angle) {
+    return isfinite(angle) && angle >= 0.0f && angle <= SERVO_MAX_ALLOWED_ANGLE;
+}
+
+bool motor_motion_servo_pwm_duration_valid(const float duration_us) {
+    return isfinite(duration_us) && duration_us >= 0.0f && duration_us < SERVO_MAX_PULSE_DURATION_US;
+}
+
+bool motor_motion_servo_angles_valid(const float min_angle, const float max_angle) {
+    return motor_motion_servo_angle_valid(min_angle) && motor_motion_servo_angle_valid(max_angle);
+}
+
+bool motor_motion_servo_pwm_durations_valid(const float min_angle_pwm, const float max_angle_pwm) {
+    return motor_motion_servo_pwm_duration_valid(min_angle_pwm) && motor_motion_servo_pwm_duration_valid(max_angle_pwm);
+}
+
+// The slope is derived, never assigned by a caller. Recomputed at each table generation, because the cfg
+// setters can change any of the four calibration fields between refills of the same move and a stale slope
+// paired with a fresh anchor maps to neither calibration.
+static void update_pwm_scale(servo_motor_context_t *const context) {
+    const float span = context->max_angle - context->min_angle;
+    if (span == 0.0f || !isfinite(span)) {
+        LOG_WRN("Servo angle span is degenerate (%f to %f); every angle maps to the minimum pulse width",
+                (double)context->min_angle, (double)context->max_angle);
+        context->pwm_per_degree = 0.0f;
+        return;
+    }
+
+    const float scale = (context->max_angle_pwm - context->min_angle_pwm) / span;
+    if (!isfinite(scale)) {
+        // Two finite in-range angles can still be close enough together to overflow the quotient.
+        LOG_WRN("Servo angle span %f is too small for the pulse span %f to %f; every angle maps to the minimum",
+                (double)span, (double)context->min_angle_pwm, (double)context->max_angle_pwm);
+        context->pwm_per_degree = 0.0f;
+        return;
+    }
+
+    context->pwm_per_degree = scale;
+}
+
 int motor_motion_servo_init_context_struct(const float start, const float end, const float max_velocity,
                                            const float max_acceleration, const float min_angle_pwm,
                                            const float max_angle_pwm, servo_motor_context_t *context) {
@@ -101,6 +139,11 @@ int motor_motion_servo_init_context_struct(const float start, const float end, c
     context->last_time_generated = 0.0f;
     context->min_angle_pwm = min_angle_pwm;
     context->max_angle_pwm = max_angle_pwm;
+
+    // The caller must have populated `min_angle`/`max_angle` already: the slope is derived from all four
+    // calibration fields, and deriving it here makes the context usable by the converter before any table
+    // has been generated.
+    update_pwm_scale(context);
     return 0;
 }
 
@@ -290,26 +333,26 @@ static float time_at_position(const float position, const float min_step, const 
  *
  * Convert (actual) degrees to the PWM count.
  */
-static uint32_t degrees_to_pwm_count(const servo_motor_context_t *context, const float degree,
-                                     const bool calculate_scale) {
-    // Compute the scaling factor to reduce compounding errors, and only when needed.
-    static float scale_factor = 0;
-
-    if (calculate_scale) {
-        // Scale factor calculated on full potential range.
-        scale_factor = (context->max_angle_pwm - context->min_angle_pwm) / FULL_RANGE_IN_DEGREES;
-    }
-
+uint32_t motor_motion_servo_degrees_to_pwm_count(const servo_motor_context_t *const context, const float degree) {
     const float nominal_degrees = degree - context->angle_adjustment;
-    const float scaled_position = (nominal_degrees - context->min_angle) * scale_factor;
+    const float scaled_position = (nominal_degrees - context->min_angle) * context->pwm_per_degree;
     const float pwm = (scaled_position + context->min_angle_pwm) / context->pwm_timer_increment;
 
-    return roundf(pwm);
+    // Casting a non-finite or out-of-range float to `uint32_t` is undefined, and validation does not close
+    // it off: `angle_adjustment` is only checked for finiteness, so a large offset can drive this negative or
+    // past the counter. Saturate at both ends rather than cast whatever comes out.
+    if (!isfinite(pwm) || pwm <= 0.0f) {
+        return 0u;
+    }
+
+    return pwm >= (float)UINT32_MAX ? UINT32_MAX : (uint32_t)roundf(pwm);
 }
 
 ssize_t motor_motion_servo_generate_displacement_table(uint32_t *table, const size_t table_size,
                                                        servo_motor_context_t *context) {
     const float SERVO_TIME_STEP = 0.02f;
+
+    update_pwm_scale(context);
 
     size_t max_entries = (size_t)((context->motion_profile.t_t - context->last_time_generated) / SERVO_TIME_STEP);
     if (max_entries > table_size) {
@@ -323,7 +366,7 @@ ssize_t motor_motion_servo_generate_displacement_table(uint32_t *table, const si
     float time = context->last_time_generated;
     float displacement_now = displacement(time, &context->motion_profile) + start_position;
 
-    uint32_t last_pwm = degrees_to_pwm_count(context, context->last_position_generated, true);
+    uint32_t last_pwm = motor_motion_servo_degrees_to_pwm_count(context, context->last_position_generated);
 
     uint32_t table_index = 0;
     float pwm_change_zero_count = 0;
@@ -347,7 +390,7 @@ ssize_t motor_motion_servo_generate_displacement_table(uint32_t *table, const si
         displacement_now = displacement(time, &context->motion_profile) + start_position;
 
         // Calculate the change in PWM strength
-        const uint32_t pwm = degrees_to_pwm_count(context, displacement_now, false);
+        const uint32_t pwm = motor_motion_servo_degrees_to_pwm_count(context, displacement_now);
         const int32_t delta_pwm = pwm - last_pwm;
 
         if (delta_pwm == 0) {

@@ -139,12 +139,25 @@ static int servo_cfg_write_handler(const jerrycan_msg_t *msg) {
     if (dev == NULL) {
         LOG_ERR("Invalid servo device number: %d", msg->cfg_write.servo.motor_id);
         rc = -ENODEV;
+    } else if (!motor_motion_servo_pwm_durations_valid(msg->cfg_write.servo.min_pwm_duration_us,
+                                                       msg->cfg_write.servo.max_pwm_duration_us)) {
+        // In a full six-field write a negative duration is a bad value, not an omission, so it is caught here
+        // rather than swallowed by `servo_set_parameters`' "leave unchanged" sentinel. A `0` still passes the
+        // rule and is then dropped by that sentinel, exactly as before.
+        LOG_ERR("Rejected servo config: pulse durations [%f, %f] must be finite, non-negative and below %f us",
+                (double)msg->cfg_write.servo.min_pwm_duration_us, (double)msg->cfg_write.servo.max_pwm_duration_us,
+                (double)SERVO_MAX_PULSE_DURATION_US);
+        rc = -EINVAL;
     } else {
+        // Nothing may be applied unless the angles were accepted. `servo_set_parameters` installs its fields
+        // and schedules a settings save, so calling it after a rejected angle pair would persist half of a
+        // write the host is about to be NAKed for — and a NAK has to mean the configuration did not change.
         rc = servo_set_angle_parameters(dev, msg->cfg_write.servo.min_position, msg->cfg_write.servo.max_position);
-        int rc2 = servo_set_parameters(
-            dev, msg->cfg_write.servo.motor_max_velocity, msg->cfg_write.servo.motor_max_acceleration,
-            msg->cfg_write.servo.min_pwm_duration_us, msg->cfg_write.servo.max_pwm_duration_us);
-        rc = (rc != 0 ? rc : rc2);
+        if (rc == 0) {
+            rc = servo_set_parameters(
+                dev, msg->cfg_write.servo.motor_max_velocity, msg->cfg_write.servo.motor_max_acceleration,
+                msg->cfg_write.servo.min_pwm_duration_us, msg->cfg_write.servo.max_pwm_duration_us);
+        }
     }
 
     return rc;

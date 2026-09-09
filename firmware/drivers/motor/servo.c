@@ -48,7 +48,7 @@ static int ll_servo_init(const struct device *dev) {
     }
 
     // Set the Auto Reload Register to be a 20ms period (assuming 2MHz clock)
-    LL_TIM_SetAutoReload(cfg->timer, 40000);
+    LL_TIM_SetAutoReload(cfg->timer, SERVO_TIMER_PERIOD_COUNTS);
 
     LL_TIM_OC_InitTypeDef output_chan_init;
     LL_TIM_OC_StructInit(&output_chan_init);

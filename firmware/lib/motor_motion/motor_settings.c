@@ -184,6 +184,21 @@ static __used int write_bool(char *key, const char numeric, const bool value, co
 /* -------------------------------------------------------------------------- */
 
 #if CONFIG_DT_HAS_LL_SERVO_ENABLED
+/*
+ * A stored calibration field is not trustworthy: records predate the cfg-write validation and NVS can be
+ * corrupted. `validate` here is the same rule the cfg write enforces, so the two paths cannot disagree.
+ */
+static float read_calibration_float(const char *name, const settings_read_cb read_cb, void *cb_arg,
+                                    bool (*validate)(float), const float dflt) {
+    const float value = read_signed_float(name, read_cb, cb_arg, dflt);
+    if (validate(value)) {
+        return value;
+    }
+
+    LOG_WRN("Stored %s of %f is out of range; using the default %f", name, (double)value, (double)dflt);
+    return dflt;
+}
+
 /* ***** Settings Handler ***** */
 static int servo_settings_set(const char *key, size_t len, settings_read_cb read_cb, void *cb_arg,
                               struct servo_work_context *context) {
@@ -192,15 +207,22 @@ static int servo_settings_set(const char *key, size_t len, settings_read_cb read
     } else if (strncmp(key, MAX_ACCELERATION_KEY, sizeof(MAX_ACCELERATION_KEY) - 1) == 0) {
         context->motor_max_acceleration = read_float("max_acceleration", read_cb, cb_arg, true, 2000);
     } else if (strncmp(key, MIN_ANGLE_KEY, sizeof(MIN_ANGLE_KEY) - 1) == 0) {
-        context->context.min_angle = read_float("min_angle", read_cb, cb_arg, true, 0);
+        context->context.min_angle = read_calibration_float("min_angle", read_cb, cb_arg,
+                                                            motor_motion_servo_angle_valid, SERVO_DEFAULT_MIN_ANGLE);
     } else if (strncmp(key, MAX_ANGLE_KEY, sizeof(MAX_ANGLE_KEY) - 1) == 0) {
-        context->context.max_angle = read_float("max_angle", read_cb, cb_arg, true, 120);
+        context->context.max_angle = read_calibration_float("max_angle", read_cb, cb_arg,
+                                                            motor_motion_servo_angle_valid, SERVO_DEFAULT_MAX_ANGLE);
     } else if (strncmp(key, ANGLE_ADJUSTMENT_KEY, sizeof(ANGLE_ADJUSTMENT_KEY) - 1) == 0) {
-        context->context.angle_adjustment = read_float("angle_adjustment", read_cb, cb_arg, true, 0);
+        // Legitimately negative and not an angle limit, so it gets no range rule of its own — but it is
+        // subtracted from every commanded angle, so a non-finite value must not load.
+        context->context.angle_adjustment =
+            read_signed_float("angle_adjustment", read_cb, cb_arg, SERVO_DEFAULT_MIN_ANGLE);
     } else if (strncmp(key, SERVO_MIN_ANGLE_PWM_KEY, sizeof(SERVO_MIN_ANGLE_PWM_KEY) - 1) == 0) {
-        context->context.min_angle_pwm = read_float("min_angle_pwm", read_cb, cb_arg, true, 1000);
+        context->context.min_angle_pwm = read_calibration_float(
+            "min_angle_pwm", read_cb, cb_arg, motor_motion_servo_pwm_duration_valid, SERVO_DEFAULT_MIN_ANGLE_PWM);
     } else if (strncmp(key, SERVO_MAX_ANGLE_PWM_KEY, sizeof(SERVO_MAX_ANGLE_PWM_KEY) - 1) == 0) {
-        context->context.max_angle_pwm = read_float("max_angle_pwm", read_cb, cb_arg, true, 2000);
+        context->context.max_angle_pwm = read_calibration_float(
+            "max_angle_pwm", read_cb, cb_arg, motor_motion_servo_pwm_duration_valid, SERVO_DEFAULT_MAX_ANGLE_PWM);
     } else if (strncmp(key, POSITION_KEY, sizeof(POSITION_KEY) - 1) == 0) {
         // Staged, not applied: the angle limits this is validated against may load after it does, so the
         // decision belongs in the commit hook. NAN means there is nothing usable to apply.
@@ -283,8 +305,7 @@ static int servo_settings_commit(struct servo_work_context *const context) {
 
     // Judgeable against the configured travel, and inside it. An unusable pair of limits is not a licence to
     // believe the record: with `max_angle` at +Inf every finite candidate would pass a bare range test.
-    const bool acceptable = isfinite(candidate) && servo_angle_limits_usable(context) &&
-                            candidate >= context->context.min_angle && candidate <= context->context.max_angle;
+    const bool acceptable = isfinite(candidate) && servo_position_within_limits(context, candidate);
 
     if (acceptable) {
         context->context.known_position = candidate;
