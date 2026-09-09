@@ -55,6 +55,7 @@ static inline int k_work_error_handler(int error) {
             break;
         default:
             LOG_ERR("Failed to submit read_i2c_work to the system workqueue: Unknown error - %d", error);
+            error = -EINVAL;
             break;
     }
 
