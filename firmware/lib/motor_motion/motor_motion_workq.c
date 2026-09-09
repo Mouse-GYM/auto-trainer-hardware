@@ -86,8 +86,8 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
              .max_angle_pwm = SERVO_DEFAULT_MAX_ANGLE_PWM,                                   \
              .pwm_timer_increment = (DT_PROP(DT_PARENT(id), st_prescaler) + 1.0f) / 170.0f,  \
              .last_time_generated = 0.0f,                                                    \
-             .last_position_generated = 0.0f,                                                \
-             .known_position = 0.0f,                                                         \
+             .last_position_generated = SERVO_DEFAULT_MIN_ANGLE,                             \
+             .known_position = SERVO_DEFAULT_MIN_ANGLE,                                      \
          },                                                                                  \
      .buffers = {{0}},                                                                       \
      .current_buffer = 0,                                                                    \
@@ -95,6 +95,9 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
      .e_stop_triggered = {.__val = 0},                                                       \
      .motion_mode = MOTION_IDLE,                                                             \
      .motion_calculation_done = true,                                                        \
+     .position_assumed = true,                                                               \
+     .pending_position = NAN,                                                                \
+     .persisted_position = NAN,                                                              \
      .calculation_work =                                                                     \
          {                                                                                   \
              .work =                                                                         \
@@ -248,6 +251,24 @@ void servo_set_position_to_zero(const struct device *dev) {
     context->motion_calculation_done = true;
 }
 
+bool servo_angle_limits_usable(const struct servo_work_context *const context) {
+    return context != NULL && isfinite(context->context.min_angle) && isfinite(context->context.max_angle) &&
+           context->context.min_angle <= context->context.max_angle;
+}
+
+void servo_assume_min_angle_position(struct servo_work_context *const context) {
+    if (context == NULL || !context->position_assumed) {
+        return;
+    }
+
+    // `servo_set_angle_parameters` validates nothing, so a malformed cfg frame can leave a non-finite limit
+    // here; a NAN must never reach the belief fields, where the profile maths would propagate it.
+    const float position = isfinite(context->context.min_angle) ? context->context.min_angle : SERVO_DEFAULT_MIN_ANGLE;
+
+    context->context.known_position = position;
+    context->context.last_position_generated = position;
+}
+
 /* ***** Callbacks ***** */
 #ifdef CONFIG_DT_HAS_LL_STEPPER_ENABLED
 static void stepper_motor_event_callback(const struct device *const dev, ll_motor_events_t event, void *arg,
@@ -335,6 +356,14 @@ static void servo_motor_event_callback(const struct device *const dev, ll_motor_
             if (context != NULL) {
                 context->motion_mode = MOTION_DONE;
                 context->context.known_position = context->context.last_position_generated;
+                context->position_valid = true;
+
+                // The only place a position becomes persistable: the move ran to completion, so the horn is
+                // where the generator left it.
+                if (context->persisted_position != context->context.known_position) {
+                    context->persisted_position = context->context.known_position;
+                    motor_settings_save();
+                }
             }
             break;
         }
@@ -368,6 +397,7 @@ void servo_cancel_all_work(const struct device *dev) {
     context->motion_mode = MOTION_DONE;
     context->motion_calculation_done = true;
     context->context.known_position = context->context.last_position_generated;
+    context->position_valid = false;
 }
 
 static void servo_work_calculation_handler(struct k_work *work) {
@@ -561,6 +591,7 @@ int servo_set_angle_parameters(const struct device *dev, const float min_angle, 
 
     context->context.min_angle = min_angle;
     context->context.max_angle = max_angle;
+    servo_assume_min_angle_position(context);
     return 0;
 }
 
@@ -601,15 +632,26 @@ int servo_move_to_position(const struct device *dev, float target_position, cons
         target_position = context->context.max_angle;
     }
 
-    const int ret = motor_motion_servo_init_context_struct(
-        context->context.last_position_generated, target_position, movement_max_v, movement_max_a,
-        context->context.min_angle_pwm, context->context.max_angle_pwm, &context->context);
+    // Plan from the believed position. Bound it to the configured span so a host that narrows the limits after
+    // a real position was established cannot make the profile start outside the PWM endpoints — but only when
+    // the limits are usable: nothing validates them on either install path, and CLAMP with a non-finite or
+    // inverted pair yields NAN or a value outside both.
+    const float believed_position = context->context.last_position_generated;
+    const float start_position = servo_angle_limits_usable(context)
+                                     ? CLAMP(believed_position, context->context.min_angle, context->context.max_angle)
+                                     : believed_position;
+
+    const int ret = motor_motion_servo_init_context_struct(start_position, target_position, movement_max_v,
+                                                           movement_max_a, context->context.min_angle_pwm,
+                                                           context->context.max_angle_pwm, &context->context);
 
     if (ret != 0) {
         LOG_ERR("Failed to initialize context struct: %d", ret);
         return -EDOM;
     }
 
+    // The generator owns `last_position_generated` from here, so the min-angle assumption is over.
+    context->position_assumed = false;
     context->motion_mode = MOTION_IN_PROGESS;
     context->motion_calculation_done = false;
 
