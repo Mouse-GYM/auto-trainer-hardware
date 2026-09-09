@@ -13,6 +13,11 @@
 LOG_MODULE_DECLARE(ll_motor, CONFIG_LL_MOTOR_LOG_LEVEL);
 
 int ll_queue_stepper_positions(const struct device *dev, uint32_t *positions, size_t len, k_timeout_t timeout) {
+    const ll_motor_data_t *data = dev->data;
+    if (!atomic_get(&data->output_enabled)) {
+        return -ESHUTDOWN;
+    }
+
     return ll_motor_queue_data(dev, positions, len, timeout);
 }
 
@@ -46,6 +51,7 @@ int ll_stepper_set_direction(const struct device *dev, ll_stepper_dir_t dir) {
 
 static int ll_stepper_init(const struct device *dev) {
     const ll_motor_cfg_t *cfg = dev->config;
+    ll_motor_data_t *data = dev->data;
     int ret;
 
     // Configure the DIR pin
@@ -79,22 +85,35 @@ static int ll_stepper_init(const struct device *dev) {
 
     // Enable the channel
     LL_TIM_CC_EnableChannel(cfg->timer, cfg->channel);
+    atomic_set(&data->output_enabled, true);
 
     return 0;
 }
 
 int ll_stepper_disable(const struct device *dev) {
     const ll_motor_cfg_t *cfg = dev->config;
-    ll_stepper_dma_stop(dev);
+    ll_motor_data_t *data = dev->data;
 
+    k_spinlock_key_t key = k_spin_lock(&data->output_lock);
+    atomic_clear(&data->output_enabled);
     LL_TIM_CC_DisableChannel(cfg->timer, cfg->channel);
+    LL_TIM_DisableCounter(cfg->timer);
+    k_spin_unlock(&data->output_lock, key);
 
-    return 0;
+    int ret = ll_stepper_dma_stop(dev);
+    k_msgq_purge(cfg->msgq);
+
+    return ret;
 }
 
 int ll_stepper_enable(const struct device *dev) {
     const ll_motor_cfg_t *cfg = dev->config;
+    ll_motor_data_t *data = dev->data;
+
+    k_spinlock_key_t key = k_spin_lock(&data->output_lock);
+    atomic_set(&data->output_enabled, true);
     LL_TIM_CC_EnableChannel(cfg->timer, cfg->channel);
+    k_spin_unlock(&data->output_lock, key);
 
     return 0;
 }

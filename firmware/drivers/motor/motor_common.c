@@ -23,6 +23,20 @@ void ll_motor_dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t 
             return;
         }
 
+        /* A stepper stop can preempt a DMA completion callback after it has removed this block
+         * from the queue. If so, undo the reload so the stopped DMA channel cannot remain busy. */
+        if (cfg->stop_on_dma_complete) {
+            k_spinlock_key_t key = k_spin_lock(&data->output_lock);
+            bool output_enabled = atomic_get(&data->output_enabled);
+            k_spin_unlock(&data->output_lock, key);
+
+            if (!output_enabled) {
+                dma_stop(cfg->dma_dev, data->dma_channel);
+                k_msgq_purge(cfg->msgq);
+                return;
+            }
+        }
+
         // Do the callbacks after the DMA is reloaded so we don't have any gaps in the data output
         SYS_SLIST_FOR_EACH_CONTAINER(&data->callbacks, cb, node) {
             cb->func(dev, LL_MOTOR_EVENT_DMA_BLOCK_COMPLETE, arg, cb->user_data);
@@ -102,12 +116,26 @@ int ll_motor_start_dma(const struct device *dev) {
     /* Only kick a stopped timer. A running one generates its own update events, and forcing one
      * here resets CNT mid-period: in PWM1 mode that re-starts an in-progress high phase instead of
      * ending it, emitting a single pulse of up to twice the intended width. On a servo that is a
-     * visible jump forward for one 20 ms frame. The stepper reaches this path with the counter
-     * already disabled by `stop_on_dma_complete`, so it still gets its initial value promptly. */
-    if (!LL_TIM_IsEnabledCounter(cfg->timer)) {
-        // Generate an update to fetch the first value via DMA
-        LL_TIM_GenerateEvent_UPDATE(cfg->timer);
+     * visible jump forward for one 20 ms frame. */
+    if (cfg->stop_on_dma_complete) {
+        /* Serialize the final stepper start with ll_stepper_disable(). A calculation worker may
+         * already be inside this function when a stop occurs; in that case, leave the timer off
+         * and tear down the DMA transfer that was just configured. */
+        k_spinlock_key_t key = k_spin_lock(&data->output_lock);
+        if (!atomic_get(&data->output_enabled)) {
+            k_spin_unlock(&data->output_lock, key);
+            dma_stop(cfg->dma_dev, data->dma_channel);
+            k_msgq_purge(cfg->msgq);
+            return -ESHUTDOWN;
+        }
 
+        // A stepper always starts from a stopped counter, including after an explicit stop.
+        LL_TIM_GenerateEvent_UPDATE(cfg->timer);
+        LL_TIM_EnableCounter(cfg->timer);
+        k_spin_unlock(&data->output_lock, key);
+    } else if (!LL_TIM_IsEnabledCounter(cfg->timer)) {
+        // A stopped servo needs an initial value and a running servo must not be reset mid-period.
+        LL_TIM_GenerateEvent_UPDATE(cfg->timer);
         LL_TIM_EnableCounter(cfg->timer);
     }
 
@@ -131,6 +159,9 @@ int ll_motor_queue_data(const struct device *dev, uint32_t *buf, size_t len, k_t
 
     // Queue the memory block for sending
     int ret = k_msgq_put(cfg->msgq, &msg, timeout);
+    if (ret < 0) {
+        return ret;
+    }
 
     // If this was the first block and the DMA is idle, start the DMA transfer
     struct dma_status status;
