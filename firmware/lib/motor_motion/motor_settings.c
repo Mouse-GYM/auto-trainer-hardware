@@ -348,7 +348,18 @@ static int stepper_settings_set(const char *key, size_t len, settings_read_cb re
     } else if (strncmp(key, FLIP_LIMIT_ORIENTATION_KEY, sizeof(FLIP_LIMIT_ORIENTATION_KEY) - 1) == 0) {
         context->flip_limit_orientation = read_bool("flip_limit_orientation", read_cb, cb_arg, false);
     } else if (strncmp(key, FIXED_POSITION_KEY, sizeof(FIXED_POSITION_KEY) - 1) == 0) {
-        context->fixed_position = read_float("fixed", read_cb, cb_arg, true, 0);
+        const float stored = read_float("fixed", read_cb, cb_arg, true, 0);
+
+        context->persisted_fixed_position = stored;
+
+        if (IS_ENABLED(CONFIG_LIB_MOTOR_MOTION_DEFER_STEPPER_FIXED_POSITION)) {
+            if (stored != 0.0f) {
+                LOG_WRN("Ignoring stored fixed position %f for %s; reporting 0 until it is set", (double)stored,
+                        context->dev->name);
+            }
+        } else {
+            context->fixed_position = stored;
+        }
     } else {
         LOG_WRN("Unknown key: %s", key);
         return -EINVAL;
@@ -403,7 +414,7 @@ static int stepper_settings_export(const struct device *dev, const size_t dt_id,
 
     if (rc == 0) {
         static char key[] = GENERATE_STEPPER_TEMPLATE(FIXED_POSITION_KEY);
-        rc = write_float(key, numeric, context->fixed_position, id_index, storage_func);
+        rc = write_float(key, numeric, context->persisted_fixed_position, id_index, storage_func);
     }
 
     return rc;
