@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -7,6 +8,10 @@
 #ifndef M_PI
 #define M_PI 3.1415927f
 #endif
+
+// Must agree with the servo timer's auto-reload in drivers/motor/servo.c.
+#define SERVO_FRAME_PERIOD_US 20000U
+#define SERVO_TIME_STEP ((float)SERVO_FRAME_PERIOD_US / 1e6f)  // seconds
 
 typedef struct motor_motion_profile {
     /* Parameters from the paper:
@@ -123,6 +128,13 @@ int motor_motion_stepper_init_context_struct(float start, float end, float max_v
  */
 ssize_t motor_motion_servo_generate_displacement_table(uint32_t *table, size_t table_size,
                                                        servo_motor_context_t *context);
+
+/**
+ * Whether a move between two angles is too small for the generator to turn into motion: the same rounded
+ * conversion and dead-band test the generator applies, evaluated at the endpoints. Leaves the generator's
+ * cached scale factor untouched.
+ */
+bool motor_motion_servo_within_dead_band(const servo_motor_context_t *context, float from_degrees, float to_degrees);
 
 /**
  * Generates a table of values with a pulse at the correct time for each stamp.

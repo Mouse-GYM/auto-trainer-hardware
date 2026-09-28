@@ -73,8 +73,7 @@ PYBIND11_MODULE(pyjerrycan, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("ServoMove", &JerryCAN::ServoMove, py::arg("dst_id"), py::arg("motor_id"), py::arg("position"), py::arg("max_velocity"), py::arg("max_acceleration"), py::arg("abs_or_rel"), py::arg("uuid"),
              py::call_guard<py::gil_scoped_release>())
-        .def("ServoAttach", &JerryCAN::ServoAttach, py::arg("dst_id"), py::arg("motor_id"), py::call_guard<py::gil_scoped_release>())
-        .def("ServoDetach", &JerryCAN::ServoDetach, py::arg("dst_id"), py::arg("motor_id"), py::call_guard<py::gil_scoped_release>())
+        .def("ServoDetachMode", &JerryCAN::ServoDetachMode, py::arg("dst_id"), py::arg("motor_id"), py::arg("detach_after_move"), py::arg("uuid"), py::call_guard<py::gil_scoped_release>())
         .def("StepperHome", &JerryCAN::StepperHome, py::arg("dst_id"), py::arg("motor_id"), py::arg("uuid"),
              py::call_guard<py::gil_scoped_release>())
         .def("StepperCfgWrite", &JerryCAN::StepperCfgWrite, py::arg("dst_id"), py::arg("motor_id"), py::arg("microsteps"), py::arg("steps_per_revolution"), py::arg("motor_max_velocity"), py::arg("motor_max_acceleration"), py::arg("homing_velocity"), py::arg("flip_limit_orientation"), py::arg("uuid"),
@@ -112,6 +111,7 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .def_readwrite("cfg_write", &jerrycan_msg_t::cfg_write)
         .def_readwrite("stepper_status", &jerrycan_msg_t::stepper_status)
         .def_readwrite("servo_status", &jerrycan_msg_t::servo_status)
+        .def_readwrite("servo_detach_mode", &jerrycan_msg_t::servo_detach_mode)
         .def_readwrite("pressure_read", &jerrycan_msg_t::pressure_read)
         .def_readwrite("temp_hum_read", &jerrycan_msg_t::temp_hum_read)
         .def_readwrite("gpio_read", &jerrycan_msg_t::gpio_read)
@@ -298,6 +298,16 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .def_readwrite("position", &jerrycan_cmd_servo_status_t::position)
     ;
 
+    py::class_<jerrycan_cmd_servo_detach_mode_t>(m, "ServoDetachMode")
+        .def(py::init<>())
+        .def_property("motor_id",
+            [](const jerrycan_cmd_servo_detach_mode_t &a) { return a.motor_id; },
+            [](jerrycan_cmd_servo_detach_mode_t &a, const uint8_t v) { a.motor_id = v; })
+        .def_property("detach_after_move",
+            [](const jerrycan_cmd_servo_detach_mode_t &a) { return a.detach_after_move; },
+            [](jerrycan_cmd_servo_detach_mode_t &a, const bool v) { a.detach_after_move = v; })
+    ;
+
     py::class_<jerrycan_cmd_load_cell_tare_t>(m, "LoadCellTare")
         .def(py::init<>())
         .def_readwrite("instance", &jerrycan_cmd_load_cell_tare_t::instance)
@@ -421,8 +431,7 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .value("STATUS", JERRYCAN_CMD_STATUS)
         .value("STEPPER_MOVE", JERRYCAN_CMD_STEPPER_MOVE)
         .value("SERVO_MOVE", JERRYCAN_CMD_SERVO_MOVE)
-        .value("SERVO_ATTACH", JERRYCAN_CMD_SERVO_ATTACH)
-        .value("SERVO_DETACH", JERRYCAN_CMD_SERVO_DETACH)
+        .value("SERVO_DETACH_MODE", JERRYCAN_CMD_SERVO_DETACH_MODE)
         .value("STEPPER_HOME", JERRYCAN_CMD_STEPPER_HOME)
         .value("CFG_WRITE", JERRYCAN_CMD_CFG_WRITE)
         .value("CFG_READ", JERRYCAN_CMD_CFG_READ)

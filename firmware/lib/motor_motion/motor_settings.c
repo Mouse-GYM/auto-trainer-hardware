@@ -25,6 +25,7 @@ LOG_MODULE_REGISTER(motor_settings);
 #define POSITION_KEY "o_pos"
 #define SERVO_MIN_ANGLE_PWM_KEY "pwm_min"
 #define SERVO_MAX_ANGLE_PWM_KEY "pwm_max"
+#define DETACH_AFTER_MOVE_KEY "detach"
 
 // Stepper keys
 #define MICRO_STEP_KEY "s_mstep"
@@ -205,6 +206,8 @@ static int servo_settings_set(const char *key, size_t len, settings_read_cb read
         // Staged, not applied: the angle limits this is validated against may load after it does, so the
         // decision belongs in the commit hook. NAN means there is nothing usable to apply.
         context->pending_position = read_signed_float("position", read_cb, cb_arg, NAN);
+    } else if (strncmp(key, DETACH_AFTER_MOVE_KEY, sizeof(DETACH_AFTER_MOVE_KEY) - 1) == 0) {
+        context->detach_after_move = read_bool("detach_after_move", read_cb, cb_arg, false);
     } else {
         LOG_WRN("Unknown key: %s", key);
         return -EINVAL;
@@ -263,6 +266,11 @@ int servo_settings_export(const struct device *dev, const size_t dt_id,
     if (rc == 0) {
         static char key[] = GENERATE_SERVO_TEMPLATE(SERVO_MAX_ANGLE_PWM_KEY);
         rc = write_float(key, numeric, context->context.max_angle_pwm, id_index, storage_func);
+    }
+
+    if (rc == 0) {
+        static char key[] = GENERATE_SERVO_TEMPLATE(DETACH_AFTER_MOVE_KEY);
+        rc = write_bool(key, numeric, context->detach_after_move, id_index, storage_func);
     }
 
     if (rc == 0 && isfinite(context->persisted_position)) {

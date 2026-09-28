@@ -44,6 +44,14 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
 // Default 'max_acceleration' of servo
 #define SERVO_DEFAULT_MAX_ACCELERATION 100
 
+// Whole frames of drive kept after queue-empty before a detach-after-move drops it. Settling margin only:
+// the generator's duplicate tail has already put the final value on the pin.
+#define SERVO_DETACH_HOLD_FRAMES 1
+
+// Queue-empty fires as a pulse begins, and stopping the counter mid-pulse freezes the output high. The extra
+// half frame lands the detach between pulses.
+#define SERVO_DETACH_HOLD K_USEC((SERVO_DETACH_HOLD_FRAMES * SERVO_FRAME_PERIOD_US) + SERVO_FRAME_PERIOD_US / 2)
+
 // Period between successive status checks of the stepper drivers
 #define STEPPER_DRIVER_CHECK_PERIOD 100U
 // Default 'min_step' of stepper (number of steps, incl. microstepping, done per pulse)
@@ -364,6 +372,10 @@ static void servo_motor_event_callback(const struct device *const dev, ll_motor_
                     context->persisted_position = context->context.known_position;
                     motor_settings_save();
                 }
+
+                if (context->detach_after_move) {
+                    k_work_schedule_for_queue(&motor_workq, &context->detach_work, SERVO_DETACH_HOLD);
+                }
             }
             break;
         }
@@ -424,6 +436,14 @@ static void servo_work_calculation_handler(struct k_work *work) {
 
     // Increment the buffer pointer
     context->current_buffer = (context->current_buffer + 1) % BUFS_PER_MOTOR;
+}
+
+static void servo_work_detach_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    const struct servo_work_context *context = CONTAINER_OF(dwork, struct servo_work_context, detach_work);
+
+    LOG_DBG("Detaching servo after move");
+    ll_servo_enable(context->dev, false);
 }
 
 size_t stepper_generate_table_for_homing(const struct stepper_work_context *context, uint32_t *buf) {
@@ -531,6 +551,7 @@ static int motor_workq_init_and_start(void) {
 
     for (size_t i = 0; i < ARRAY_SIZE(servo_contexts); i++) {
         k_work_init_delayable(&servo_contexts[i].calculation_work, servo_work_calculation_handler);
+        k_work_init_delayable(&servo_contexts[i].detach_work, servo_work_detach_handler);
     }
 
     motor_settings_init();
@@ -595,6 +616,28 @@ int servo_set_angle_parameters(const struct device *dev, const float min_angle, 
     return 0;
 }
 
+int servo_set_detach_after_move(const struct device *dev, const bool detach_after_move) {
+    struct servo_work_context *const context = find_servo_context_from_device(dev);
+    if (context == NULL) {
+        return -ENODEV;
+    }
+
+    if (context->detach_after_move == detach_after_move) {
+        return 0;
+    }
+
+    context->detach_after_move = detach_after_move;
+
+    // Nothing else would release a servo left attached while the mode was off. Mid-move there is nothing to
+    // do here: that move's completion reads the new value.
+    if (detach_after_move && context->motion_mode != MOTION_IN_PROGESS) {
+        ll_servo_enable(context->dev, false);
+    }
+
+    motor_settings_save();
+    return 0;
+}
+
 int servo_move_to_position(const struct device *dev, float target_position, const float max_velocity,
                            const float max_acceleration) {
     struct servo_work_context *context = find_servo_context_from_device(dev);
@@ -641,6 +684,17 @@ int servo_move_to_position(const struct device *dev, float target_position, cons
                                      ? CLAMP(believed_position, context->context.min_angle, context->context.max_angle)
                                      : believed_position;
 
+    // A request the generator could not turn into motion would only re-assert where the horn already is,
+    // attaching a detached servo to do it. The first move of a power cycle always drives: firmware has not yet
+    // put the horn anywhere, whatever the believed position says.
+    if (context->position_valid &&
+        motor_motion_servo_within_dead_band(&context->context, start_position, target_position)) {
+        LOG_INF("Servo move from %f to %f is within the dead band; skipping", (double)start_position,
+                (double)target_position);
+        context->motion_mode = MOTION_DONE;
+        return 0;
+    }
+
     const int ret = motor_motion_servo_init_context_struct(start_position, target_position, movement_max_v,
                                                            movement_max_a, context->context.min_angle_pwm,
                                                            context->context.max_angle_pwm, &context->context);
@@ -648,6 +702,12 @@ int servo_move_to_position(const struct device *dev, float target_position, cons
     if (ret != 0) {
         LOG_ERR("Failed to initialize context struct: %d", ret);
         return -EDOM;
+    }
+
+    // A detach still pending from the previous move would otherwise land mid-motion.
+    struct k_work_sync sync;
+    if (k_work_cancel_delayable_sync(&context->detach_work, &sync)) {
+        LOG_DBG("Cancelled pending detach");
     }
 
     // The generator owns `last_position_generated` from here, so the min-angle assumption is over.

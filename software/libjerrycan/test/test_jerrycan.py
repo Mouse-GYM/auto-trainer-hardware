@@ -53,6 +53,11 @@ def test_servo_move(jc):
     jc.ServoMove(DESTINATION_NODE, 0, 0, 0, 0, False)
 
 
+def test_servo_detach_mode(jc):
+    jc.ServoDetachMode(DESTINATION_NODE, 0, True, 0)
+    jc.ServoDetachMode(DESTINATION_NODE, 0, False, 0)
+
+
 def test_stepper_home(jc):
     jc.StepperHome(DESTINATION_NODE, 0)
 

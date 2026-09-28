@@ -18,6 +18,7 @@ LOG_MODULE_DECLARE(motor_motion, CONFIG_LIB_MOTOR_MOTION_LOG_LEVEL);
 #define FE_ALL_BUT_INEXACT (FE_ALL_EXCEPT & ~FE_INEXACT)
 
 #define FULL_RANGE_IN_DEGREES 120  // per data sheet, physical movement to within 0..120 degrees.
+#define DEAD_BAND_THRESHOLD 4U     // Minimum PWM change required to overcome static friction
 
 static void print_fp_error(const int errs) {
     if (errs & FE_DIVBYZERO) {
@@ -286,6 +287,19 @@ static float time_at_position(const float position, const float min_step, const 
     return time;
 }
 
+static float servo_pwm_per_degree(const servo_motor_context_t *context) {
+    // Scale factor calculated on full potential range.
+    return (context->max_angle_pwm - context->min_angle_pwm) / FULL_RANGE_IN_DEGREES;
+}
+
+static uint32_t pwm_count_at(const servo_motor_context_t *context, const float degree, const float scale_factor) {
+    const float nominal_degrees = degree - context->angle_adjustment;
+    const float scaled_position = (nominal_degrees - context->min_angle) * scale_factor;
+    const float pwm = (scaled_position + context->min_angle_pwm) / context->pwm_timer_increment;
+
+    return roundf(pwm);
+}
+
 /**
  *
  * Convert (actual) degrees to the PWM count.
@@ -296,21 +310,23 @@ static uint32_t degrees_to_pwm_count(const servo_motor_context_t *context, const
     static float scale_factor = 0;
 
     if (calculate_scale) {
-        // Scale factor calculated on full potential range.
-        scale_factor = (context->max_angle_pwm - context->min_angle_pwm) / FULL_RANGE_IN_DEGREES;
+        scale_factor = servo_pwm_per_degree(context);
     }
 
-    const float nominal_degrees = degree - context->angle_adjustment;
-    const float scaled_position = (nominal_degrees - context->min_angle) * scale_factor;
-    const float pwm = (scaled_position + context->min_angle_pwm) / context->pwm_timer_increment;
+    return pwm_count_at(context, degree, scale_factor);
+}
 
-    return roundf(pwm);
+bool motor_motion_servo_within_dead_band(const servo_motor_context_t *context, const float from_degrees,
+                                         const float to_degrees) {
+    const float scale_factor = servo_pwm_per_degree(context);
+    const int32_t delta_pwm =
+        pwm_count_at(context, to_degrees, scale_factor) - pwm_count_at(context, from_degrees, scale_factor);
+
+    return fabs(delta_pwm) < DEAD_BAND_THRESHOLD;
 }
 
 ssize_t motor_motion_servo_generate_displacement_table(uint32_t *table, const size_t table_size,
                                                        servo_motor_context_t *context) {
-    const float SERVO_TIME_STEP = 0.02f;
-
     size_t max_entries = (size_t)((context->motion_profile.t_t - context->last_time_generated) / SERVO_TIME_STEP);
     if (max_entries > table_size) {
         max_entries = table_size;
@@ -332,7 +348,6 @@ ssize_t motor_motion_servo_generate_displacement_table(uint32_t *table, const si
 
     for (float time_step = 1.0f; table_index < max_entries; ++time_step) {
         const float POSITION_THRESHOLD = 0.001f;  // (degrees)
-        const uint32_t DEAD_BAND_THRESHOLD = 4;   // Minimum PWM change required to overcome static friction
         const int32_t MAX_PWM_CHANGE_ZERO_COUNT = 20;
 
         // at desired location?

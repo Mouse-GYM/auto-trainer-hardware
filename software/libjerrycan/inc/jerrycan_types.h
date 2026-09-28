@@ -56,8 +56,7 @@ typedef enum __attribute__((packed)) {
     JERRYCAN_CMD_BOOTLOADER_DATA = 0x1A,
     JERRYCAN_CMD_DELAY = 0x1B,
     JERRYCAN_CMD_FIXED_XYZ = 0x1C,
-    JERRYCAN_CMD_SERVO_ATTACH = 0x1D,
-    JERRYCAN_CMD_SERVO_DETACH = 0x1E,
+    JERRYCAN_CMD_SERVO_DETACH_MODE = 0x1F,
     JERRYCAN_RSP_ACK = 0x30,
     JERRYCAN_CMD_MIN = 0x00,
     JERRYCAN_CMD_MAX = 0x3F,
@@ -124,12 +123,13 @@ SIZE_CHECK(jerrycan_cmd_stepper_home_t, 1);
 // I think the payload for this message can be the same format as the stepper move message
 typedef jerrycan_cmd_stepper_move_t jerrycan_cmd_servo_move_t;
 
-
 typedef struct __attribute__((packed)) {
     uint8_t motor_id;
-} jerrycan_cmd_servo_attach_t;
+    bool detach_after_move : 1;
+    uint8_t rsvd0 : 7;
+} jerrycan_cmd_servo_detach_mode_t;
 
-typedef jerrycan_cmd_servo_attach_t jerrycan_cmd_servo_detach_t;
+SIZE_CHECK(jerrycan_cmd_servo_detach_mode_t, 2);
 
 typedef enum __attribute__((packed)) {
     JERRYCAN_CFG_STEPPER,
@@ -389,6 +389,7 @@ typedef struct __attribute__((packed)) {
                 jerrycan_cmd_cfg_t cfg_read;
                 jerrycan_cmd_stepper_status_t stepper_status;
                 jerrycan_cmd_servo_status_t servo_status;
+                jerrycan_cmd_servo_detach_mode_t servo_detach_mode;
                 jerrycan_cmd_pressure_read_t pressure_read;
                 jerrycan_cmd_temp_hum_read_t temp_hum_read;
                 jerrycan_cmd_gpio_read_t gpio_read;

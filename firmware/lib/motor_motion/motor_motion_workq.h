@@ -31,6 +31,7 @@ struct servo_work_context {
     atomic_flag e_stop_triggered;
     motion_mode_t motion_mode;
     bool motion_calculation_done;
+    bool detach_after_move;  // Consulted only at queue-empty, when deciding whether to schedule detach_work.
 
     // While `position_assumed` is set, `known_position` and `last_position_generated` hold `min_angle` and
     // follow it; an accepted stored position or a started move ends that permanently. `position_valid` means
@@ -43,7 +44,7 @@ struct servo_work_context {
     float persisted_position;
 
     struct k_work_delayable calculation_work;
-    struct k_work_delayable submission_work;
+    struct k_work_delayable detach_work;
     ll_servo_cb_t servo_cb;
     float motor_max_velocity;
     float motor_max_acceleration;
@@ -100,11 +101,20 @@ int servo_set_parameters(const struct device *dev, float max_velocity, float max
  */
 int servo_set_angle_parameters(const struct device *dev, const float min_angle, const float max_angle);
 
+/*
+ * Choose whether the servo drops drive after each completed move. Setting the current value is a no-op.
+ * Turning it on also detaches a servo that has no move in flight. Persisted.
+ *
+ * @retval -ENODEV if the device is not found among the static context structs.
+ */
+int servo_set_detach_after_move(const struct device *dev, bool detach_after_move);
+
 /**
  * Move to the position specified, using the motion profiles in `motor_math.*`.
  *
  * @retval -ENODEV if the device is not found in the list.
  * @retval -EBUSY if another motion profile is already running.
+ * @note Thread context only, and never the motor work queue: it waits for a pending detach to be cancelled.
  */
 int servo_move_to_position(const struct device *dev, float target_position, float max_velocity, float max_acceleration);
 

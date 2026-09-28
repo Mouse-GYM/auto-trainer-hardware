@@ -10,6 +10,8 @@
  * Key Functions:
  * - `servo_handler()`: Processes incoming servo movement commands and logs the
  *    motion parameters. (Integration with the motor library is pending)
+ * - `servo_detach_mode_handler()`: Sets whether the servo drops drive after each
+ *    completed move. Acknowledged immediately.
  * - `servo_cfg_write_handler()`: Handles configuration write messages for setting
  *    servo parameters, such as minimum, middle, and maximum positions.
  * - `servo_cfg_read_handler()`: Responds to configuration read requests by sending
@@ -94,30 +96,22 @@ static jerrycan_rx_callback_t servo_callback = {
     .func = servo_handler,
 };
 
-static int servo_attach_handler(const jerrycan_msg_t *msg) {
-    const struct device *dev = servo_motor_by_id(msg->servo_move.motor_id);
+static int servo_detach_mode_handler(const jerrycan_msg_t *msg) {
+    LOG_INF("Received servo detach mode message: motor_id=%d, detach_after_move=%d uuid=%d",
+            msg->servo_detach_mode.motor_id, msg->servo_detach_mode.detach_after_move, (int)msg->uuid);
 
-    ll_servo_enable(dev, true);
+    const struct device *dev = servo_motor_by_id(msg->servo_detach_mode.motor_id);
+    if (dev == NULL) {
+        LOG_ERR("Invalid servo device number: %d", msg->servo_detach_mode.motor_id);
+        return -ENODEV;
+    }
 
-    return SEND_NO_ACKNOWLEDGEMENT;
+    return servo_set_detach_after_move(dev, msg->servo_detach_mode.detach_after_move);
 }
 
-static jerrycan_rx_callback_t servo_attach_callback = {
-    .filter_msg_type = JERRYCAN_CMD_SERVO_ATTACH,
-    .func = servo_attach_handler,
-};
-
-static int servo_detach_handler(const jerrycan_msg_t *msg) {
-    const struct device *dev = servo_motor_by_id(msg->servo_move.motor_id);
-
-    ll_servo_enable(dev, false);
-
-    return SEND_NO_ACKNOWLEDGEMENT;
-}
-
-static jerrycan_rx_callback_t servo_detach_callback = {
-    .filter_msg_type = JERRYCAN_CMD_SERVO_DETACH,
-    .func = servo_detach_handler,
+static jerrycan_rx_callback_t servo_detach_mode_callback = {
+    .filter_msg_type = JERRYCAN_CMD_SERVO_DETACH_MODE,
+    .func = servo_detach_mode_handler,
 };
 
 static int servo_cfg_write_handler(const jerrycan_msg_t *msg) {
@@ -234,8 +228,7 @@ K_TIMER_DEFINE(jerrycan_servo_status_tx_timer, jerrycan_servo_status_tx, NULL);
 
 static int jerrycan_servo_init() {
     jerrycan_register_rx_callback(&servo_callback);
-    jerrycan_register_rx_callback(&servo_attach_callback);
-    jerrycan_register_rx_callback(&servo_detach_callback);
+    jerrycan_register_rx_callback(&servo_detach_mode_callback);
     jerrycan_register_rx_callback(&servo_cfg_write_callback);
     jerrycan_register_rx_callback(&servo_cfg_read_callback);
 
