@@ -2,6 +2,7 @@
 
 #include <stdatomic.h>
 #include <zephyr/device.h>
+#include <zephyr/sys/atomic.h>
 
 #include "motor_callbacks.h"
 #include "motor_math.h"
@@ -16,7 +17,17 @@
 typedef uint32_t servo_buffer_set[BUFS_PER_MOTOR][SERVO_BUFFER_SIZE];
 typedef uint32_t stepper_buffer_set[BUFS_PER_MOTOR][STEPPER_BUFFER_SIZE];
 
-typedef enum { MOTION_IDLE, MOTION_IN_PROGESS, MOTION_DONE } motion_mode_t;
+// MOTION_FAULT: a stepper move was aborted by the protection monitor. The CAN layer acks it with
+// `stepper_fault_error` and returns it to MOTION_IDLE, as it does for MOTION_DONE.
+typedef enum { MOTION_IDLE, MOTION_IN_PROGESS, MOTION_DONE, MOTION_FAULT } motion_mode_t;
+
+// Stepper protection faults (`stepper_work_context.fault`). Latched until `stepper_clear_fault`.
+#define STEPPER_FAULT_OVERTEMP_WARNING BIT(0)  // Driver reported otpw during a move.
+#define STEPPER_FAULT_OVERTEMP BIT(1)          // Driver reported ot during a move.
+// A move or homing didn't finish within its timeout, or homing covered its maximum travel without reaching the
+// limit switch.
+#define STEPPER_FAULT_MOVE_TIMEOUT BIT(2)
+#define STEPPER_FAULT_DRIVER_COMM BIT(3)  // DRV_STATUS couldn't be read during a move.
 
 struct servo_work_context {
     const struct device *dev;  // Motor device to use
@@ -67,9 +78,23 @@ struct stepper_work_context {
     _Atomic ll_stepper_dir_t motor_direction;
     motion_mode_t motion_mode;
     bool motion_calculation_done;
+    bool homing_ramp_done;  // Homing has finished accelerating and now steps at the homing velocity.
+    // Pulses homing may still generate before it has covered CONFIG_LIB_MOTOR_MOTION_STEPPER_HOMING_MAX_TRAVEL.
+    uint32_t homing_pulses_left;
+    // Set from the DMA callback when homing played out all its pulses without reaching the limit switch; the
+    // monitor turns it into a fault.
+    bool homing_travel_exhausted;
     struct k_work_delayable calculation_work;
     struct k_work_delayable check_driver_work;
     ll_stepper_cb_t stepper_cb;
+
+    // Protection. While `fault` has any STEPPER_FAULT_* bit set, moves and homing are refused. `driver_disabled`
+    // means the driver's power stage was confirmed off (toff = 0). `move_deadline_ms` is the uptime by which the
+    // current move or homing must finish, 0 for none.
+    atomic_t fault;
+    bool driver_disabled;
+    int64_t move_deadline_ms;
+    uint8_t drv_status_read_failures;
 
     // Motion parameters that should be constant for the motor
     // (Load these from the settings, they are rarely changed.)
@@ -135,10 +160,13 @@ int stepper_set_parameters(const struct device *dev, float motor_max_velocity, f
 int stepper_save_fixed_location(struct stepper_work_context *context, int motor_id, float position, bool is_absolute);
 
 /**
- * Move to the position specified, using the motion profiles in `motor_math.*`.
+ * Move to the position specified, using the motion profiles in `motor_math.*`. While the move runs, the driver's
+ * DRV_STATUS is polled; on otpw or ot, or if the move outlasts its timeout (proportional to the distance), the
+ * move is aborted, the driver is disabled, and `motion_mode` becomes MOTION_FAULT.
  *
  * @retval -ENODEV if the device is not found in the list.
  * @retval -EBUSY if another motion profile is already running.
+ * @retval -EPERM if a protection fault is latched; see `stepper_clear_fault`.
  */
 int stepper_move_to_position(const struct device *dev, float target_position, float max_velocity,
                              float max_acceleration);
@@ -148,7 +176,42 @@ int stepper_move_to_position(const struct device *dev, float target_position, fl
  */
 int stepper_move_relative(const struct device *dev, float delta_position, float max_velocity, float max_acceleration);
 
+/*
+ * Drive toward the limit switch, ramping up to the homing velocity. DRV_STATUS is polled as for a move. Homing
+ * stops stepping once it has covered CONFIG_LIB_MOTOR_MOTION_STEPPER_HOMING_MAX_TRAVEL and faults with
+ * STEPPER_FAULT_MOVE_TIMEOUT if the switch wasn't reached, or sooner if it outlasts a move's timeout for that
+ * distance. Returns -EPERM if a protection fault is latched.
+ */
 int stepper_home(const struct device *dev);
+
+/**
+ * Clear a latched protection fault and re-enable the driver. Blocks for the driver's UART exchanges (tens of
+ * ms); don't call from an ISR. Clearing does nothing about the position: the aborted move stopped short of
+ * `last_position_generated`, so the caller should home before relying on it.
+ *
+ * @retval 0 if no fault is latched, or once the driver reads back as enabled and the fault is cleared.
+ * @retval -ENODEV if the device is not found in the list.
+ * @retval -EBUSY if the motor is moving.
+ * @retval -EAGAIN if the driver still reports otpw or ot; the fault stays latched.
+ * @retval -EIO or another -errno if the driver can't be read or re-enabled; the fault stays latched.
+ */
+int stepper_clear_fault(const struct device *dev);
+
+/**
+ * @return the latched STEPPER_FAULT_* bits, 0 if none or the device is not found. Safe to call from ISRs.
+ */
+uint32_t stepper_get_fault(const struct device *dev);
+
+/**
+ * @return whether the protection has confirmed the driver's power stage is off. Safe to call from ISRs.
+ */
+bool stepper_driver_output_disabled(const struct device *dev);
+
+/**
+ * @return the error to acknowledge a move aborted with `fault`: -ETIMEDOUT for a move timeout alone,
+ *         otherwise -EIO.
+ */
+int stepper_fault_error(uint32_t fault);
 
 /*
  * Cancel all work on the motor.

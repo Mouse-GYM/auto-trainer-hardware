@@ -33,6 +33,7 @@
 
 #include <zephyr/logging/log.h>
 
+#include "adi_tmc2209.h"
 #include "jerrycan.h"
 #include "motor_motion.h"
 #include "motor_motion_workq.h"
@@ -132,7 +133,13 @@ static void set_uuid_for_xyz_context(uint8_t uuid) {
     }
 }
 
-static bool attempt_motor_move(int motor_id) {
+/**
+ * Start motor `motor_id`'s leg of the fixed-XYZ sequence.
+ *
+ * @return `monitor_state` if the move started; `skip_state` if it didn't, which the sequence treats as nothing to
+ *         do; or MOVING_NONE, after acking the error, if the motor has a protection fault latched.
+ */
+static moving_state_t attempt_motor_move(int motor_id, moving_state_t monitor_state, moving_state_t skip_state) {
     const struct device *dev = stepper_motor_by_id(motor_id);
     struct stepper_work_context *context = find_stepper_context_from_device(dev);
 
@@ -140,12 +147,17 @@ static bool attempt_motor_move(int motor_id) {
     const int rc = stepper_move_to_position(dev, context->fixed_position, context->motor_max_velocity,
                                             context->motor_max_acceleration);
 
-    if (rc < 0) {
-        context->motion_mode = MOTION_DONE;
-        return false;
+    if (rc == -EPERM) {
+        jerrycan_send_ack(context->uuid, rc);
+        return MOVING_NONE;
     }
 
-    return true;
+    if (rc < 0) {
+        context->motion_mode = MOTION_DONE;
+        return skip_state;
+    }
+
+    return monitor_state;
 }
 
 static bool is_motor_motion_complete(moving_state_t state) {
@@ -167,6 +179,16 @@ static void stepper_handle_motion_complete() {
                 jerrycan_send_ack(context->uuid, 0);
                 moving_state = MOVING_NONE;
             }
+        } else if (context && context->motion_mode == MOTION_FAULT) {
+            // The protection aborted this move. Fail the command it belongs to: a single move or homing, or
+            // whichever leg of the fixed-XYZ sequence was running, which ends the sequence.
+            const int error = stepper_fault_error(stepper_get_fault(dev));
+            LOG_ERR("Motion fault for %d. state=%d. uuid=%d. error=%d", i, moving_state, context->uuid, error);
+            context->motion_mode = MOTION_IDLE;
+            if (moving_state != MOVING_NONE) {
+                jerrycan_send_ack(context->uuid, error);
+                moving_state = MOVING_NONE;
+            }
         }
     }
 }
@@ -177,7 +199,7 @@ static void stepper_handle_fixed_sequence() {
     switch (moving_state) {
         case MOVE_X:
             motor_id = get_motor_id_for_state(moving_state);
-            moving_state = attempt_motor_move(motor_id) ? MONITOR_X : MOVE_Z;
+            moving_state = attempt_motor_move(motor_id, MONITOR_X, MOVE_Z);
             break;
 
         case MONITOR_X:
@@ -188,7 +210,7 @@ static void stepper_handle_fixed_sequence() {
 
         case MOVE_Y:
             motor_id = get_motor_id_for_state(moving_state);
-            moving_state = attempt_motor_move(motor_id) ? MONITOR_Y : MOVING_COMPLETE;
+            moving_state = attempt_motor_move(motor_id, MONITOR_Y, MOVING_COMPLETE);
             break;
 
         case MONITOR_Y:
@@ -199,7 +221,7 @@ static void stepper_handle_fixed_sequence() {
 
         case MOVE_Z:
             motor_id = get_motor_id_for_state(moving_state);
-            moving_state = attempt_motor_move(motor_id) ? MONITOR_Z : MOVE_Y;
+            moving_state = attempt_motor_move(motor_id, MONITOR_Z, MOVE_Y);
             break;
 
         case MONITOR_Z:
@@ -333,6 +355,62 @@ static jerrycan_rx_callback_t stepper_home_callback = {
     .func = stepper_home_handler,
 };
 
+static int stepper_fault_clear_handler(const jerrycan_msg_t *msg) {
+    const struct device *dev = stepper_motor_by_id(msg->stepper_fault_clear.motor_id);
+    if (dev == NULL) {
+        LOG_ERR("Failed to clear stepper fault: Invalid stepper device number - %d", msg->stepper_fault_clear.motor_id);
+        return -ENODEV;
+    }
+
+    LOG_INF("Clearing fault on motor %d with UUID=%d", msg->stepper_fault_clear.motor_id, msg->uuid);
+    return stepper_clear_fault(dev);
+}
+
+static jerrycan_rx_callback_t stepper_fault_clear_callback = {
+    .filter_msg_type = JERRYCAN_CMD_STEPPER_FAULT_CLEAR,
+    .func = stepper_fault_clear_handler,
+};
+
+/**
+ * @return JERRYCAN_STEPPER_STATUS_* bits for the stepper driver behind `stepper`.
+ */
+static uint8_t stepper_driver_status(const struct device *stepper) {
+    const ll_motor_cfg_t *cfg = stepper->config;
+    uint8_t status = 0;
+
+    if (cfg->stepper_driver_device != NULL) {
+        const uint32_t faults = adi_tmc2209_get_init_check(cfg->stepper_driver_device)->faults;
+        if (faults & ADI_TMC2209_FAULT_UART_READ) {
+            status |= JERRYCAN_STEPPER_STATUS_DRIVER_UART_FAULT;
+        }
+        if (faults & ADI_TMC2209_FAULT_WRITE_LOST) {
+            status |= JERRYCAN_STEPPER_STATUS_DRIVER_WRITE_LOST;
+        }
+        if (faults & ADI_TMC2209_FAULT_READBACK) {
+            status |= JERRYCAN_STEPPER_STATUS_DRIVER_READBACK_FAULT;
+        }
+    }
+
+    const uint32_t fault = stepper_get_fault(stepper);
+    if (fault & STEPPER_FAULT_OVERTEMP_WARNING) {
+        status |= JERRYCAN_STEPPER_STATUS_OVERTEMP_WARNING;
+    }
+    if (fault & STEPPER_FAULT_OVERTEMP) {
+        status |= JERRYCAN_STEPPER_STATUS_OVERTEMP;
+    }
+    if (fault & STEPPER_FAULT_MOVE_TIMEOUT) {
+        status |= JERRYCAN_STEPPER_STATUS_MOVE_TIMEOUT;
+    }
+    if (fault & STEPPER_FAULT_DRIVER_COMM) {
+        status |= JERRYCAN_STEPPER_STATUS_DRIVER_COMM_LOST;
+    }
+    if (stepper_driver_output_disabled(stepper)) {
+        status |= JERRYCAN_STEPPER_STATUS_DRIVER_DISABLED;
+    }
+
+    return status;
+}
+
 static void jerrycan_stepper_status_tx(const struct device *stepper) {
     const struct stepper_work_context *context = find_stepper_context_from_device(stepper);
 
@@ -343,7 +421,7 @@ static void jerrycan_stepper_status_tx(const struct device *stepper) {
     jerrycan_msg_t msg = {.type = JERRYCAN_CMD_STEPPER_STATUS,
                           .stepper_status = {
                               .motor_id = motor_id,
-                              .status = 0,  // TODO: Do something with this?
+                              .status = stepper_driver_status(stepper),
                               .homing_status = stepper_homing_status(stepper),
                               .position = position,
                               .send_position = send_position,
@@ -377,6 +455,7 @@ static int jerrycan_stepper_init() {
     jerrycan_register_rx_callback(&stepper_cfg_read_callback);
     jerrycan_register_rx_callback(&stepper_home_callback);
     jerrycan_register_rx_callback(&stepper_fixed_callback);
+    jerrycan_register_rx_callback(&stepper_fault_clear_callback);
 
     /* Start timer to send the stepper status messages periodically */
     k_timer_start(&jerrycan_stepper_status_tx_timer, K_MSEC(100),

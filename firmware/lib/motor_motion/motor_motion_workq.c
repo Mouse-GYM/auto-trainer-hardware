@@ -44,8 +44,10 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
 // Default 'max_acceleration' of servo
 #define SERVO_DEFAULT_MAX_ACCELERATION 100
 
-// Period between successive status checks of the stepper drivers
+// Period between successive status checks (DRV_STATUS and move timeout) of a moving stepper
 #define STEPPER_DRIVER_CHECK_PERIOD 100U
+// Consecutive failed DRV_STATUS reads during a move before the driver counts as unreachable
+#define STEPPER_DRV_STATUS_READ_FAILURES 3U
 // Default 'min_step' of stepper (number of steps, incl. microstepping, done per pulse)
 #define STEPPER_DEFAULT_STEPS_PER_REVOLUTION 48.0f
 // Default 'max_velocity' of stepper
@@ -199,6 +201,17 @@ struct servo_work_context servo_contexts[] = {DT_FOREACH_STATUS_OKAY(ll_servo, D
 static struct k_work_q motor_workq;
 static K_THREAD_STACK_DEFINE(motor_workq_stack, CONFIG_LIB_MOTOR_MOTION_WORK_QUEUE_STACK_SIZE);
 
+// Stepper protection runs apart from `motor_workq`: each DRV_STATUS read blocks for about 10 ms, which must not
+// delay the step-buffer refills.
+static struct k_work_q stepper_monitor_workq;
+#if DT_HAS_COMPAT_STATUS_OKAY(ll_stepper)
+static K_THREAD_STACK_DEFINE(stepper_monitor_workq_stack, CONFIG_LIB_MOTOR_MOTION_STEPPER_MONITOR_STACK_SIZE);
+#endif
+
+// Held across tripping a fault and across clearing one, so a clear can't re-enable a driver the monitor is still
+// disabling.
+static K_MUTEX_DEFINE(stepper_fault_lock);
+
 /* ***** Helper Functions ***** */
 
 struct servo_work_context *find_servo_context_from_device(const struct device *dev) {
@@ -300,6 +313,11 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
                     case MOVING_HOME:
                         if (!context->motion_calculation_done) {
                             k_work_schedule_for_queue(&motor_workq, &context->calculation_work, K_NO_WAIT);
+                        } else if (context->motion_mode == MOTION_IN_PROGESS) {
+                            // Every pulse of the maximum travel went out and the limit switch never stopped
+                            // the motor. Disabling the driver needs the UART, so the monitor raises the fault.
+                            context->homing_travel_exhausted = true;
+                            k_work_reschedule_for_queue(&stepper_monitor_workq, &context->check_driver_work, K_NO_WAIT);
                         }
                         break;
                 }
@@ -445,9 +463,44 @@ size_t stepper_generate_table_for_homing(const struct stepper_work_context *cont
     return n_pulses;
 }
 
+/**
+ * Fill `buf` with the next block of homing pulses: the acceleration ramp of the profile `stepper_home` set up,
+ * then constant pulses at the homing velocity until the limit switch stops the motor. There's no ramp down.
+ * Blocks stop at `homing_pulses_left`; the block that uses the last of them ends the calculation.
+ */
+static size_t stepper_generate_homing_block(struct stepper_work_context *context, uint32_t *buf) {
+    size_t n_pulses = 0;
+    if (!context->homing_ramp_done) {
+        const ssize_t ret = motor_motion_stepper_generate_ramp_table(buf, STEPPER_BUFFER_SIZE, &context->context);
+        if (ret < STEPPER_BUFFER_SIZE) {
+            context->homing_ramp_done = true;
+        }
+        if (ret > 0) {
+            n_pulses = (size_t)ret;
+        }
+    }
+
+    if (n_pulses == 0) {
+        n_pulses = stepper_generate_table_for_homing(context, buf);
+    }
+
+    n_pulses = MIN(n_pulses, context->homing_pulses_left);
+    context->homing_pulses_left -= n_pulses;
+    if (context->homing_pulses_left == 0) {
+        context->motion_calculation_done = true;
+    }
+
+    return n_pulses;
+}
+
 static void stepper_work_calculation_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct stepper_work_context *context = CONTAINER_OF(dwork, struct stepper_work_context, calculation_work);
+
+    // The motor was stopped after this refill was scheduled; queuing a block now would restart the DMA.
+    if (context->motion_calculation_done) {
+        return;
+    }
 
     switch (context->move_control) {
         default:
@@ -481,7 +534,7 @@ static void stepper_work_calculation_handler(struct k_work *work) {
         } break;
 
         case MOVING_HOME: {
-            const size_t ret = stepper_generate_table_for_homing(context, context->buffers[context->current_buffer]);
+            const size_t ret = stepper_generate_homing_block(context, context->buffers[context->current_buffer]);
             context->last_calculation_ret = ret;
 
             LOG_DBG("Q buf %d [%p]", context->current_buffer, (void *)context->buffers[context->current_buffer]);
@@ -493,14 +546,186 @@ static void stepper_work_calculation_handler(struct k_work *work) {
     }
 }
 
+/* ***** Stepper Protection ***** */
+
+static const struct device *stepper_driver_of(const struct stepper_work_context *context) {
+    const ll_motor_cfg_t *cfg = context->dev->config;
+    return cfg->stepper_driver_device;
+}
+
+/**
+ * Timeout for a move of `distance` revolutions. The nominal duration d/v + 2v/a is the profile's total time t_t
+ * when it reaches `velocity`, and bounds t_t = 2 * sqrt(2d/a) from above when it doesn't, so the timeout grows in
+ * proportion to the distance.
+ */
+static int64_t stepper_move_timeout_ms(const float distance, const float velocity, const float acceleration) {
+    const float nominal_s = distance / velocity + 2.0f * velocity / acceleration;
+    return (int64_t)(nominal_s * (float)CONFIG_LIB_MOTOR_MOTION_STEPPER_MOVE_TIMEOUT_PERCENT * 10.0f) +
+           CONFIG_LIB_MOTOR_MOTION_STEPPER_MOVE_TIMEOUT_MARGIN_MS;
+}
+
+/**
+ * Start polling a move that has just started. Safe to call from ISRs: the fixed-XYZ sequence starts moves from a
+ * timer. `move_deadline_ms` must already be set, before `motion_mode` became MOTION_IN_PROGESS.
+ */
+static void stepper_monitor_start(struct stepper_work_context *context) {
+    k_work_reschedule_for_queue(&stepper_monitor_workq, &context->check_driver_work,
+                                K_MSEC(STEPPER_DRIVER_CHECK_PERIOD));
+}
+
+/**
+ * Read the driver's DRV_STATUS and return the STEPPER_FAULT_* bits it warrants. The bus is shared and a reply can
+ * be lost, so one failed read passes; STEPPER_DRV_STATUS_READ_FAILURES in a row is a fault, since the
+ * temperature can no longer be watched.
+ */
+static uint32_t stepper_poll_driver(struct stepper_work_context *context) {
+    const struct device *driver = stepper_driver_of(context);
+    if (driver == NULL) {
+        return 0;
+    }
+
+    adi_tmc2209_reg_t reg = {0};
+    const int ret = adi_tmc2209_read_drv_status(driver, &reg);
+    if (ret < 0) {
+        context->drv_status_read_failures++;
+        LOG_WRN("Stepper %d DRV_STATUS read failed (%d), %u in a row", ll_motor_get_id(context->dev), ret,
+                context->drv_status_read_failures);
+        return context->drv_status_read_failures >= STEPPER_DRV_STATUS_READ_FAILURES ? STEPPER_FAULT_DRIVER_COMM : 0;
+    }
+    context->drv_status_read_failures = 0;
+
+    uint32_t fault = 0;
+    if (reg.drv_status.otpw) {
+        fault |= STEPPER_FAULT_OVERTEMP_WARNING;
+    }
+    if (reg.drv_status.ot) {
+        fault |= STEPPER_FAULT_OVERTEMP;
+    }
+
+    return fault;
+}
+
+/**
+ * Latch `fault`, stop stepping, disable the driver, and hand the move to the CAN layer as MOTION_FAULT so it is
+ * acked with an error. What happens next is the host's call; see `stepper_clear_fault`.
+ */
+static void stepper_trip_fault(struct stepper_work_context *context, const uint32_t fault) {
+    const uint8_t motor_id = ll_motor_get_id(context->dev);
+
+    k_mutex_lock(&stepper_fault_lock, K_FOREVER);
+    atomic_or(&context->fault, (atomic_val_t)fault);
+
+    // Claim the move before stopping it, so a DMA or limit-switch event can't report it as done.
+    const unsigned int key = irq_lock();
+    if (context->motion_mode == MOTION_IN_PROGESS) {
+        context->motion_mode = MOTION_FAULT;
+    }
+    context->motion_calculation_done = true;
+    irq_unlock(key);
+
+    // No more refills, then halt the pulse train and drop the queued blocks.
+    struct k_work_sync sync;
+    k_work_cancel_delayable_sync(&context->calculation_work, &sync);
+    ll_stepper_abort(context->dev);
+
+    const struct device *driver = stepper_driver_of(context);
+    if (driver != NULL) {
+        const int ret = adi_tmc2209_output_disable(driver);
+        context->driver_disabled = ret == 0;
+        if (ret < 0) {
+            LOG_ERR("Stepper %d driver not confirmed disabled (%d); STEP output is stopped", motor_id, ret);
+        }
+    }
+    k_mutex_unlock(&stepper_fault_lock);
+
+    LOG_ERR("Stepper %d fault 0x%X: move aborted at %f rev (generated), driver %s", motor_id, fault,
+            (double)context->context.last_position_generated, context->driver_disabled ? "disabled" : "NOT disabled");
+}
+
 static void stepper_work_check_driver_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
-    // struct stepper_work_context *context = CONTAINER_OF(dwork, struct stepper_work_context, check_driver_work);
+    struct stepper_work_context *context = CONTAINER_OF(dwork, struct stepper_work_context, check_driver_work);
 
-    // TODO: IMPLEMENT
+    // Only a moving stepper is watched; the next move reschedules this.
+    if (context->motion_mode != MOTION_IN_PROGESS) {
+        return;
+    }
 
-    k_work_reschedule_for_queue(&motor_workq, dwork, K_MSEC(STEPPER_DRIVER_CHECK_PERIOD));
+    uint32_t fault = stepper_poll_driver(context);
+    if (context->move_deadline_ms != 0 && k_uptime_get() > context->move_deadline_ms) {
+        fault |= STEPPER_FAULT_MOVE_TIMEOUT;
+    }
+    if (context->homing_travel_exhausted) {
+        context->homing_travel_exhausted = false;
+        LOG_ERR("Stepper %d covered its maximum homing travel without reaching the limit switch",
+                ll_motor_get_id(context->dev));
+        fault |= STEPPER_FAULT_MOVE_TIMEOUT;
+    }
+
+    if (fault != 0) {
+        stepper_trip_fault(context, fault);
+        return;
+    }
+
+    k_work_reschedule_for_queue(&stepper_monitor_workq, dwork, K_MSEC(STEPPER_DRIVER_CHECK_PERIOD));
 }
+
+int stepper_clear_fault(const struct device *dev) {
+    struct stepper_work_context *context = find_stepper_context_from_device(dev);
+    if (context == NULL) {
+        return -ENODEV;
+    }
+
+    const uint8_t motor_id = ll_motor_get_id(dev);
+    int ret = 0;
+
+    k_mutex_lock(&stepper_fault_lock, K_FOREVER);
+    const uint32_t fault = (uint32_t)atomic_get(&context->fault);
+    if (context->motion_mode == MOTION_IN_PROGESS) {
+        ret = -EBUSY;
+    } else if (fault != 0 || context->driver_disabled) {
+        const struct device *driver = stepper_driver_of(context);
+        if (driver != NULL) {
+            adi_tmc2209_reg_t reg = {0};
+            ret = adi_tmc2209_read_drv_status(driver, &reg);
+            if (ret == 0 && (reg.drv_status.otpw || reg.drv_status.ot)) {
+                LOG_WRN("Stepper %d driver still reports otpw %d ot %d", motor_id, reg.drv_status.otpw,
+                        reg.drv_status.ot);
+                ret = -EAGAIN;
+            }
+            if (ret == 0) {
+                ret = adi_tmc2209_output_enable(driver);
+            }
+        }
+
+        if (ret == 0) {
+            context->driver_disabled = false;
+            context->drv_status_read_failures = 0;
+            atomic_clear(&context->fault);
+        }
+    }
+    k_mutex_unlock(&stepper_fault_lock);
+
+    if (ret < 0) {
+        LOG_ERR("Stepper %d fault 0x%X not cleared: %d", motor_id, fault, ret);
+    } else if (fault != 0) {
+        LOG_INF("Stepper %d fault 0x%X cleared, driver enabled", motor_id, fault);
+    }
+
+    return ret;
+}
+
+uint32_t stepper_get_fault(const struct device *dev) {
+    const struct stepper_work_context *context = find_stepper_context_from_device(dev);
+    return context == NULL ? 0 : (uint32_t)atomic_get(&context->fault);
+}
+
+bool stepper_driver_output_disabled(const struct device *dev) {
+    const struct stepper_work_context *context = find_stepper_context_from_device(dev);
+    return context != NULL && context->driver_disabled;
+}
+
+int stepper_fault_error(const uint32_t fault) { return fault == STEPPER_FAULT_MOVE_TIMEOUT ? -ETIMEDOUT : -EIO; }
 
 /* ***** Initialization ***** */
 static int motor_workq_init_and_start(void) {
@@ -547,6 +772,13 @@ static int motor_workq_init_and_start(void) {
 
     k_work_queue_start(&motor_workq, motor_workq_stack, K_THREAD_STACK_SIZEOF(motor_workq_stack),
                        CONFIG_LIB_MOTOR_MOTION_WORK_QUEUE_PRIORITY, NULL);
+
+#if DT_HAS_COMPAT_STATUS_OKAY(ll_stepper)
+    k_work_queue_init(&stepper_monitor_workq);
+    k_work_queue_start(&stepper_monitor_workq, stepper_monitor_workq_stack,
+                       K_THREAD_STACK_SIZEOF(stepper_monitor_workq_stack),
+                       CONFIG_LIB_MOTOR_MOTION_STEPPER_MONITOR_PRIORITY, NULL);
+#endif
     return 0;
 }
 
@@ -760,6 +992,11 @@ int stepper_move_to_position(const struct device *dev, const float target_positi
         return -EBUSY;
     }
 
+    if (atomic_get(&context->fault) != 0) {
+        LOG_ERR("Attempted to move with fault 0x%lX latched", atomic_get(&context->fault));
+        return -EPERM;
+    }
+
     if (atomic_flag_test_and_set(&context->e_stop_triggered)) {
         LOG_ERR("Attempted to move motor after e-stop without homing!");
         return -EBUSY;
@@ -789,6 +1026,7 @@ int stepper_move_to_position(const struct device *dev, const float target_positi
 
     const float movement_max_a = MIN(context->motor_max_acceleration, max_acceleration);
     const float movement_max_v = MIN(context->motor_max_velocity, max_velocity);
+    const float distance = fabsf(target_position - context->context.last_position_generated);
     const int ret = motor_motion_stepper_init_context_struct(
         context->context.last_position_generated, target_position, movement_max_v, movement_max_a, context->microsteps,
         context->timer_increment, context->motor_steps_per_revolution, &context->context);
@@ -797,6 +1035,11 @@ int stepper_move_to_position(const struct device *dev, const float target_positi
         LOG_ERR("Failed to initialize context struct: %d", ret);
         return -EDOM;
     }
+
+    // Set before MOTION_IN_PROGESS so a pending check can't judge this move by the last one's deadline.
+    context->move_deadline_ms = k_uptime_get() + stepper_move_timeout_ms(distance, movement_max_v, movement_max_a);
+    context->drv_status_read_failures = 0;
+    context->homing_travel_exhausted = false;
 
     context->motion_mode = MOTION_IN_PROGESS;
     context->move_control = MOVING_POSITION;
@@ -832,6 +1075,8 @@ int stepper_move_to_position(const struct device *dev, const float target_positi
     // Increment the buffer pointer
     context->current_buffer = (context->current_buffer + 1) % BUFS_PER_MOTOR;
 
+    stepper_monitor_start(context);
+
     return 0;
 }
 
@@ -852,6 +1097,11 @@ int stepper_home(const struct device *dev) {
 
     const ll_motor_cfg_t *cfg = dev->config;
 
+    if (atomic_get(&work_context->fault) != 0) {
+        LOG_ERR("Attempted to home with fault 0x%lX latched", atomic_get(&work_context->fault));
+        return -EPERM;
+    }
+
     if (cfg->limit_switch_pin.port == NULL) {
         LOG_ERR("Limit switch pin not set");
         return -ENOTSUP;
@@ -871,6 +1121,33 @@ int stepper_home(const struct device *dev) {
     atomic_flag_clear(&work_context->e_stop_triggered);
 
     context->min_step = 1.0f / work_context->microsteps;
+
+    // Ramp up as a move does, over a displacement long enough to reach the homing velocity; after the ramp,
+    // `stepper_generate_homing_block` holds that velocity until the limit switch. Homing heads toward position
+    // 0, so the profile runs down from the current position.
+    const float homing_v = work_context->homing_velocity;
+    const float homing_a = work_context->motor_max_acceleration;
+    const float ramp_start = context->last_position_generated;
+    const int ramp_ret = motor_motion_stepper_init_context_struct(
+        ramp_start, ramp_start - 4.0f * homing_v * homing_v / homing_a, homing_v, homing_a, work_context->microsteps,
+        work_context->timer_increment, work_context->motor_steps_per_revolution, context);
+    work_context->homing_ramp_done = ramp_ret != 0;
+    if (ramp_ret != 0) {
+        LOG_WRN("Homing ramp unavailable (%d); homing at constant velocity", ramp_ret);
+    }
+
+    // Timed like a move across the longest homing travel. Homing doesn't ramp down, so this is a little more
+    // generous than the move it's modelled on. Set before MOTION_IN_PROGESS so a pending check can't judge
+    // homing by the last move's deadline.
+    work_context->move_deadline_ms =
+        k_uptime_get() +
+        stepper_move_timeout_ms((float)CONFIG_LIB_MOTOR_MOTION_STEPPER_HOMING_MAX_TRAVEL, homing_v, homing_a);
+    work_context->drv_status_read_failures = 0;
+    // The pulses in the longest homing travel: position units * full steps per unit * pulses per full step.
+    work_context->homing_pulses_left =
+        (uint32_t)lroundf((float)CONFIG_LIB_MOTOR_MOTION_STEPPER_HOMING_MAX_TRAVEL *
+                          work_context->motor_steps_per_revolution * (float)work_context->microsteps);
+    work_context->homing_travel_exhausted = false;
     work_context->move_control = MOVING_HOME;
     work_context->motion_mode = MOTION_IN_PROGESS;
     work_context->motor_direction =
@@ -881,14 +1158,25 @@ int stepper_home(const struct device *dev) {
 
     ll_stepper_enable(dev);
 
-    const size_t ret = stepper_generate_table_for_homing(work_context, work_context->buffers[0]);
-    work_context->last_calculation_ret = (ssize_t)ret;
+    // Queue every buffer, as a move does, so each block completing triggers the next refill without a gap.
+    for (int i = 0; i < BUFS_PER_MOTOR; i++) {
+        const size_t ret = stepper_generate_homing_block(work_context, work_context->buffers[i]);
+        work_context->last_calculation_ret = (ssize_t)ret;
 
-    LOG_DBG("Q buf %d [%p]", work_context->current_buffer, (void *)work_context->buffers[0]);
-    ll_queue_stepper_positions(dev, work_context->buffers[0], work_context->last_calculation_ret * sizeof(uint32_t),
-                               K_FOREVER);
+        LOG_DBG("Q buf %d [%p]", i, (void *)work_context->buffers[i]);
+        ll_queue_stepper_positions(dev, work_context->buffers[i], ret * sizeof(uint32_t), K_FOREVER);
 
-    work_context->current_buffer = 1 % BUFS_PER_MOTOR;
+        // The whole travel fit in this block; an empty one would confuse the DMA callbacks.
+        if (work_context->motion_calculation_done) {
+            break;
+        }
+    }
+
+    // buffers[0] plays out first, so it is the first to refill.
+    work_context->current_buffer = 0;
+
+    stepper_monitor_start(work_context);
+
     return 0;
 }
 

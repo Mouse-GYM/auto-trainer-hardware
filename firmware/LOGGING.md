@@ -140,8 +140,14 @@ CONFIG_LOG_CMDS=y
 `drivers/motor/adi_tmc2209.c` registers as
 `LOG_MODULE_REGISTER(adi_tmc2209, CONFIG_ADI_TMC2209_DEBUG_LEVEL)`. That Kconfig symbol is defined in
 `drivers/motor/Kconfig.adi_tmc2209` and deliberately defaults to **1 (ERR only)**, so its INFO and
-DEBUG messages are compiled out. Set `CONFIG_ADI_TMC2209_DEBUG_LEVEL=3` or `4` in the pellet module
-configuration to include them.
+DEBUG messages are compiled out. The pellet module's `prj.conf` sets it to 3 so the configuration
+check at the end of driver init logs IFCNT and the GCONF, CHOPCONF and IHOLD_IRUN values it read
+back; set it to `4` to include DEBUG as well.
+
+That check runs at POST_KERNEL, before USB enumerates, so its log lines are often lost (see above).
+Its result is stored: `adi_tmc2209 init_check <device>` prints it from the shell, and any failure
+sets bits in the `status` byte of that motor's `STEPPER_STATUS` CAN message
+(`jerrycan_stepper_status_flags_t`).
 
 ---
 

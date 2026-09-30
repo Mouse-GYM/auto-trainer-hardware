@@ -58,6 +58,7 @@ typedef enum __attribute__((packed)) {
     JERRYCAN_CMD_FIXED_XYZ = 0x1C,
     JERRYCAN_CMD_SERVO_ATTACH = 0x1D,
     JERRYCAN_CMD_SERVO_DETACH = 0x1E,
+    JERRYCAN_CMD_STEPPER_FAULT_CLEAR = 0x1F,
     JERRYCAN_RSP_ACK = 0x30,
     JERRYCAN_CMD_MIN = 0x00,
     JERRYCAN_CMD_MAX = 0x3F,
@@ -120,6 +121,16 @@ typedef struct __attribute__((packed)) {
 } jerrycan_cmd_stepper_home_t;
 
 SIZE_CHECK(jerrycan_cmd_stepper_home_t, 1);
+
+// Clear a stepper's latched protection fault (see jerrycan_stepper_status_flags_t) and re-enable its driver.
+// Acked with 0 when the driver is enabled again or nothing was latched; -EAGAIN while the driver still reports
+// otpw or ot; -EBUSY while the motor is moving; -EIO if the driver can't be reached. The aborted move stopped
+// short of the reported position, so home before relying on it.
+typedef struct __attribute__((packed)) {
+    uint8_t motor_id;
+} jerrycan_cmd_stepper_fault_clear_t;
+
+SIZE_CHECK(jerrycan_cmd_stepper_fault_clear_t, 1);
 
 // I think the payload for this message can be the same format as the stepper move message
 typedef jerrycan_cmd_stepper_move_t jerrycan_cmd_servo_move_t;
@@ -295,6 +306,23 @@ typedef struct __attribute__((packed)) {
 
 SIZE_CHECK(jerrycan_cmd_stepper_status_t, 12);
 
+// Bits of `jerrycan_cmd_stepper_status_t.status`; 0 means no fault.
+// 0x01-0x04 come from the stepper driver's configuration check at boot and are held until reset.
+// 0x08-0x40 are protection faults latched during a move or homing. The move is aborted and acked with -EIO, or
+// -ETIMEDOUT for MOVE_TIMEOUT alone; further moves and homing are refused with -EPERM until
+// JERRYCAN_CMD_STEPPER_FAULT_CLEAR succeeds.
+// 0x80 reports that the protection switched the driver's power stage off; the motor freewheels.
+typedef enum __attribute__((packed)) {
+    JERRYCAN_STEPPER_STATUS_DRIVER_UART_FAULT = 0x01,     // Driver didn't answer a verification read.
+    JERRYCAN_STEPPER_STATUS_DRIVER_WRITE_LOST = 0x02,     // Driver didn't accept every configuration write.
+    JERRYCAN_STEPPER_STATUS_DRIVER_READBACK_FAULT = 0x04, // Driver register didn't read back as written.
+    JERRYCAN_STEPPER_STATUS_OVERTEMP_WARNING = 0x08,      // Driver reported otpw (temperature prewarning).
+    JERRYCAN_STEPPER_STATUS_OVERTEMP = 0x10,              // Driver reported ot (overtemperature shutdown).
+    JERRYCAN_STEPPER_STATUS_MOVE_TIMEOUT = 0x20,          // Move or homing timed out, or homing missed the switch.
+    JERRYCAN_STEPPER_STATUS_DRIVER_COMM_LOST = 0x40,      // DRV_STATUS couldn't be read during the move.
+    JERRYCAN_STEPPER_STATUS_DRIVER_DISABLED = 0x80,       // Driver power stage off (CHOPCONF.toff = 0).
+} jerrycan_stepper_status_flags_t;
+
 typedef struct __attribute__((packed)) {
     uint8_t motor_id;
     uint8_t status;
@@ -384,6 +412,7 @@ typedef struct __attribute__((packed)) {
                 jerrycan_cmd_stepper_move_t stepper_move;
                 jerrycan_cmd_servo_move_t servo_move;
                 jerrycan_cmd_stepper_home_t stepper_home;
+                jerrycan_cmd_stepper_fault_clear_t stepper_fault_clear;
                 jerrycan_cmd_cfg_t cfg_write;
                 jerrycan_cmd_cfg_t cfg_response;
                 jerrycan_cmd_cfg_t cfg_read;

@@ -25,6 +25,13 @@ typedef struct adi_tmc2209_config {
 } adi_tmc2209_config_t;
 
 typedef struct adi_tmc2209_data {
+    uint8_t writes_sent;  // Write datagrams sent, modulo 256, to compare against IFCNT.
+    // Last values written to the registers checked after init.
+    adi_tmc2209_reg_t written_gconf;
+    adi_tmc2209_reg_t written_chopconf;
+    adi_tmc2209_reg_t written_ihold_irun;
+    adi_tmc2209_init_check_t init_check;
+    uint8_t enabled_toff;  // Last nonzero CHOPCONF.toff written; `adi_tmc2209_output_enable` restores it.
 } adi_tmc2209_data_t;
 
 #define SYNC_NIBBLE 0x05U
@@ -33,6 +40,12 @@ typedef struct adi_tmc2209_data {
 #define HOST_ADDR 0xFFU
 
 #define SLEEP_DELAY() k_sleep(K_MSEC(10))
+
+/* Every driver shares the one single-wire UART, and the motor monitor polls DRV_STATUS from its own thread while
+ * the CAN thread may be writing CHOPCONF. This keeps datagrams from interleaving, and read-modify-write sequences
+ * hold it across all their transfers. k_mutex is recursive for its owner, so those can call the locked
+ * read/write. Never take it from an ISR. */
+static K_MUTEX_DEFINE(adi_tmc2209_bus_lock);
 
 /**
  * @returns crc of `data[0 : size]` (Polynomial is x^8 + x^2 + x + 1.)
@@ -142,6 +155,28 @@ static int write_single_line_uart_and_flush_read(const struct device *dev, const
  */
 static int adi_tmc2209_write(const struct device *dev, const uint8_t reg_address, adi_tmc2209_reg_t data) {
     const adi_tmc2209_config_t *config = dev->config;
+    adi_tmc2209_data_t *dev_data = dev->data;
+
+    k_mutex_lock(&adi_tmc2209_bus_lock, K_FOREVER);
+
+    // Record the value for the post-init check before it's byte-swapped below.
+    switch (reg_address) {
+        case REG_GCONF:
+            dev_data->written_gconf = data;
+            break;
+        case REG_CHOPCONF:
+            dev_data->written_chopconf = data;
+            if (data.chopconf.toff != 0) {
+                dev_data->enabled_toff = data.chopconf.toff;
+            }
+            break;
+        case REG_IHOLD_IRUN:
+            dev_data->written_ihold_irun = data;
+            break;
+        default:
+            break;
+    }
+    dev_data->writes_sent++;
 
     // Convert from host to network byte order
     data.as_uint32 = sys_cpu_to_be32(data.as_uint32);
@@ -159,20 +194,15 @@ static int adi_tmc2209_write(const struct device *dev, const uint8_t reg_address
     store_crc(datagram.raw, sizeof(datagram.raw));
     write_single_line_uart_and_flush_read(dev, datagram.raw, sizeof(datagram.raw));
 
+    k_mutex_unlock(&adi_tmc2209_bus_lock);
+
     return 0;
 }
 
 /**
- * Read `data` from `reg_address` on `device`.
- *
- * @param dev Device handle; must not be NULL
- * @param reg_address
- * @param data must be 4 bytes long.
- *
- * @retval 0 on success
- * @retval -errno on error.
+ * The request/reply exchange of `adi_tmc2209_read`; the caller holds `adi_tmc2209_bus_lock`.
  */
-static int adi_tmc2209_read(const struct device *dev, const uint8_t reg_address, adi_tmc2209_reg_t *data) {
+static int adi_tmc2209_read_datagram(const struct device *dev, const uint8_t reg_address, adi_tmc2209_reg_t *data) {
     const adi_tmc2209_config_t *config = dev->config;
 
     if (data == NULL) {
@@ -219,6 +249,24 @@ static int adi_tmc2209_read(const struct device *dev, const uint8_t reg_address,
     data->as_uint32 = sys_be32_to_cpu(reply_datagram.fields.data.as_uint32);
 
     return 0;
+}
+
+/**
+ * Read `data` from `reg_address` on `device`.
+ *
+ * @param dev Device handle; must not be NULL
+ * @param reg_address
+ * @param data must be 4 bytes long.
+ *
+ * @retval 0 on success
+ * @retval -errno on error.
+ */
+static int adi_tmc2209_read(const struct device *dev, const uint8_t reg_address, adi_tmc2209_reg_t *data) {
+    k_mutex_lock(&adi_tmc2209_bus_lock, K_FOREVER);
+    const int ret = adi_tmc2209_read_datagram(dev, reg_address, data);
+    k_mutex_unlock(&adi_tmc2209_bus_lock);
+
+    return ret;
 }
 
 /**
@@ -407,7 +455,10 @@ int adi_tmc2209_set_ihold_irun(const struct device *dev, const uint8_t hold_curr
     return adi_tmc2209_write(dev, REG_IHOLD_IRUN, val);
 }
 
-int adi_tmc2209_set_microstep(const struct device *dev, const uint32_t steps_per_fullstep) {
+/**
+ * The read-modify-write of `adi_tmc2209_set_microstep`; the caller holds `adi_tmc2209_bus_lock`.
+ */
+static int adi_tmc2209_set_mres(const struct device *dev, const uint32_t steps_per_fullstep) {
     const adi_tmc2209_config_t *config = dev->config;
     adi_tmc2209_reg_t val = {0};
     int ret = adi_tmc2209_read(dev, REG_CHOPCONF, &val);
@@ -455,6 +506,66 @@ int adi_tmc2209_set_microstep(const struct device *dev, const uint32_t steps_per
     val.chopconf.mres = mres;
     ret = adi_tmc2209_write(dev, REG_CHOPCONF, val);
     return ret;
+}
+
+int adi_tmc2209_set_microstep(const struct device *dev, const uint32_t steps_per_fullstep) {
+    k_mutex_lock(&adi_tmc2209_bus_lock, K_FOREVER);
+    const int ret = adi_tmc2209_set_mres(dev, steps_per_fullstep);
+    k_mutex_unlock(&adi_tmc2209_bus_lock);
+
+    return ret;
+}
+
+int adi_tmc2209_read_drv_status(const struct device *dev, adi_tmc2209_reg_t *drv_status) {
+    return adi_tmc2209_read(dev, REG_DRV_STATUS, drv_status);
+}
+
+/**
+ * Set CHOPCONF.toff, leaving every other CHOPCONF field as the IC reports it, and confirm it by reading it back.
+ * The read, write and readback hold the bus lock together so a concurrent CHOPCONF update can't interleave.
+ *
+ * @return 0 on success, -EIO if the readback doesn't match, -errno if the IC can't be read.
+ */
+static int adi_tmc2209_set_toff(const struct device *dev, const uint8_t toff) {
+    const adi_tmc2209_config_t *config = dev->config;
+    adi_tmc2209_reg_t reg = {0};
+
+    k_mutex_lock(&adi_tmc2209_bus_lock, K_FOREVER);
+    int ret = adi_tmc2209_read(dev, REG_CHOPCONF, &reg);
+    if (ret == 0) {
+        reg.chopconf.toff = toff;
+        ret = adi_tmc2209_write(dev, REG_CHOPCONF, reg);
+    }
+    if (ret == 0) {
+        ret = adi_tmc2209_read(dev, REG_CHOPCONF, &reg);
+    }
+    if (ret == 0 && reg.chopconf.toff != toff) {
+        ret = -EIO;
+    }
+    k_mutex_unlock(&adi_tmc2209_bus_lock);
+
+    if (ret < 0) {
+        LOG_ERR("[Dev: %d] Failed (%d) to set toff to %d; CHOPCONF read 0x%08X", config->address, ret, toff,
+                reg.as_uint32);
+    } else {
+        LOG_INF("[Dev: %d] toff set to %d", config->address, toff);
+    }
+
+    return ret;
+}
+
+int adi_tmc2209_output_disable(const struct device *dev) { return adi_tmc2209_set_toff(dev, 0); }
+
+int adi_tmc2209_output_enable(const struct device *dev) {
+    const adi_tmc2209_config_t *config = dev->config;
+    const adi_tmc2209_data_t *dev_data = dev->data;
+
+    if (dev_data->enabled_toff == 0) {
+        LOG_ERR("[Dev: %d] No enabled toff recorded to restore", config->address);
+        return -EINVAL;
+    }
+
+    return adi_tmc2209_set_toff(dev, dev_data->enabled_toff);
 }
 
 /**
@@ -537,6 +648,107 @@ static int adi_tmc2209_coolstep_disable(const struct device *dev) {
     return ret;
 }
 
+// Bits of GCONF and CHOPCONF that read back as written; the rest are reserved.
+#define GCONF_RW_MASK 0x000003FFU
+#define CHOPCONF_RW_MASK 0xFF0387FFU
+
+/**
+ * Read `reg_address` into `read` and compare the bits in `rw_mask` against `written`.
+ *
+ * @return 0 if they match, otherwise the ADI_TMC2209_FAULT_* bit describing the failure.
+ */
+static uint32_t adi_tmc2209_check_readback(const struct device *dev, const char *name, const uint8_t reg_address,
+                                           const uint32_t rw_mask, const adi_tmc2209_reg_t written,
+                                           adi_tmc2209_reg_t *read) {
+    const adi_tmc2209_config_t *config = dev->config;
+
+    read->as_uint32 = 0;
+    const int ret = adi_tmc2209_read(dev, reg_address, read);
+    if (ret < 0) {
+        LOG_ERR("[Dev: %d] Failed (%d) to read back %s", config->address, ret, name);
+        return ADI_TMC2209_FAULT_UART_READ;
+    }
+
+    if ((read->as_uint32 & rw_mask) != (written.as_uint32 & rw_mask)) {
+        LOG_ERR("[Dev: %d] %s read back 0x%08X, wrote 0x%08X", config->address, name, read->as_uint32,
+                written.as_uint32);
+        return ADI_TMC2209_FAULT_READBACK;
+    }
+
+    LOG_INF("[Dev: %d] %s 0x%08X, matches write", config->address, name, read->as_uint32);
+    return 0;
+}
+
+/**
+ * Confirm the configuration written by `adi_tmc2209_init` reached the IC, log it, and store the
+ * result for `adi_tmc2209_get_init_check`.
+ * * IFCNT counts write datagrams the IC accepted (valid CRC, its address); reads don't change it.
+ *   It must have advanced by exactly the number of writes sent since `ifcnt_before` was read.
+ * * GCONF and CHOPCONF are read back and compared with the last values written.
+ * * IHOLD_IRUN is write-only, so its read is logged but not compared; IFCNT confirms that write.
+ *
+ * @param ifcnt_before_ret return value of the IFCNT read taken before the configuration writes
+ * @param ifcnt_before value of that read
+ * @param writes_before `writes_sent` at the time of that read
+ */
+static void adi_tmc2209_verify_init(const struct device *dev, const int ifcnt_before_ret,
+                                    const adi_tmc2209_reg_t ifcnt_before, const uint8_t writes_before) {
+    const adi_tmc2209_config_t *config = dev->config;
+    adi_tmc2209_data_t *dev_data = dev->data;
+    adi_tmc2209_init_check_t *check = &dev_data->init_check;
+
+    check->faults = 0;
+    check->writes_sent = dev_data->writes_sent - writes_before;
+    check->ifcnt_before = ifcnt_before.ifcnt & 0xFF;
+
+    adi_tmc2209_reg_t ifcnt_after = {0};
+    const int ifcnt_after_ret = adi_tmc2209_read(dev, REG_IFCNT, &ifcnt_after);
+    check->ifcnt_after = ifcnt_after.ifcnt & 0xFF;
+    if (ifcnt_before_ret < 0 || ifcnt_after_ret < 0) {
+        LOG_ERR("[Dev: %d] Failed (%d, %d) to read IFCNT, can't confirm %u writes", config->address,
+                ifcnt_before_ret, ifcnt_after_ret, check->writes_sent);
+        check->faults |= ADI_TMC2209_FAULT_UART_READ;
+    } else {
+        const uint8_t advanced = check->ifcnt_after - check->ifcnt_before;
+        if (advanced != check->writes_sent) {
+            LOG_ERR("[Dev: %d] IFCNT %u -> %u advanced by %u, but %u writes were sent", config->address,
+                    check->ifcnt_before, check->ifcnt_after, advanced, check->writes_sent);
+            check->faults |= ADI_TMC2209_FAULT_WRITE_LOST;
+        } else {
+            LOG_INF("[Dev: %d] IFCNT %u -> %u, all %u writes accepted", config->address, check->ifcnt_before,
+                    check->ifcnt_after, check->writes_sent);
+        }
+    }
+
+    check->gconf_written = dev_data->written_gconf;
+    check->faults |= adi_tmc2209_check_readback(dev, "GCONF", REG_GCONF, GCONF_RW_MASK, check->gconf_written,
+                                                &check->gconf_read);
+
+    check->chopconf_written = dev_data->written_chopconf;
+    check->faults |= adi_tmc2209_check_readback(dev, "CHOPCONF", REG_CHOPCONF, CHOPCONF_RW_MASK,
+                                                check->chopconf_written, &check->chopconf_read);
+    LOG_INF("[Dev: %d] CHOPCONF vsense %d, mres %d, toff %d, tbl %d", config->address,
+            check->chopconf_read.chopconf.vsense, check->chopconf_read.chopconf.mres,
+            check->chopconf_read.chopconf.toff, check->chopconf_read.chopconf.tbl);
+
+    check->ihold_irun_written = dev_data->written_ihold_irun;
+    check->ihold_irun_read.as_uint32 = 0;
+    const int ihold_irun_ret = adi_tmc2209_read(dev, REG_IHOLD_IRUN, &check->ihold_irun_read);
+    LOG_INF("[Dev: %d] IHOLD_IRUN wrote 0x%08X (irun %d, ihold %d, iholddelay %d); write-only, read gave 0x%08X (%d)",
+            config->address, check->ihold_irun_written.as_uint32, check->ihold_irun_written.ihold_irun.irun,
+            check->ihold_irun_written.ihold_irun.ihold, check->ihold_irun_written.ihold_irun.iholddelay,
+            check->ihold_irun_read.as_uint32, ihold_irun_ret);
+
+    if (check->faults != 0) {
+        LOG_ERR("[Dev: %d] Configuration check failed, faults 0x%X", config->address, check->faults);
+    }
+}
+
+const adi_tmc2209_init_check_t *adi_tmc2209_get_init_check(const struct device *dev) {
+    const adi_tmc2209_data_t *dev_data = dev->data;
+    return &dev_data->init_check;
+}
+
 /**
  * Configure this driver according to our motors' characteristics. Some general notes:
  * * We are using the internal clock which is factory trimmed to 12MHz.
@@ -547,10 +759,16 @@ static int adi_tmc2209_coolstep_disable(const struct device *dev) {
  */
 static int adi_tmc2209_init(const struct device *dev) {
     const adi_tmc2209_config_t *config = dev->config;
+    const adi_tmc2209_data_t *dev_data = dev->data;
 
     struct OTP_READ_data_fields otp_to_prog = {0};
     otp_to_prog.otp_ihold = 1;
     adi_tmc2209_set_otp(dev, otp_to_prog);
+
+    // Snapshot the interface counter; every write from here on is checked against it at the end.
+    adi_tmc2209_reg_t ifcnt_before = {0};
+    const int ifcnt_before_ret = adi_tmc2209_read(dev, REG_IFCNT, &ifcnt_before);
+    const uint8_t writes_before = dev_data->writes_sent;
 
     adi_tmc2209_reg_t val = {0};
 
@@ -585,8 +803,10 @@ static int adi_tmc2209_init(const struct device *dev) {
     }
 
     // Set IHOLD and IRUN according to our motor's characteristics.
-    const uint8_t default_irun = 10;        // 9 => 353mA RMS current (nominal for these motors), but lower is better
-                                            // Note: we have vsense set to ON here, so the value is effectively halved.
+    // The actuators are rated 0.49 A per phase, taken here as the peak of the sine current. With vsense on and
+    // 180 mOhm sense resistors, I_rms = irun/32 * 0.18 V / (0.18 + 0.02) Ohm / sqrt(2) = irun/32 * 0.636 A.
+    // 17 => 0.338 A RMS, 0.478 A peak: the largest setting that keeps the peak within the rating.
+    const uint8_t default_irun = 17;
     const uint8_t default_ihold = 1;        // Use as little current as possible in standstill to reduce heating.
     const uint8_t default_iholddelay = 15;  // Use the greatest time because otherwise it's choppy at low speed.
     ret = adi_tmc2209_set_ihold_irun(dev, default_ihold, default_irun, default_iholddelay);
@@ -639,6 +859,8 @@ static int adi_tmc2209_init(const struct device *dev) {
     if (ret < 0) {
         LOG_ERR("[Dev: %d] Failed (%d) to set pwmconf", config->address, ret);
     }
+
+    adi_tmc2209_verify_init(dev, ifcnt_before_ret, ifcnt_before, writes_before);
 
     return ret;
 }

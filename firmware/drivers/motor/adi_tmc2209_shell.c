@@ -257,6 +257,29 @@ static int cmd_dump_otp(const struct shell *shell, const int argc, const char *a
     return dump_otp(shell, device);
 }
 
+static int cmd_init_check(const struct shell *shell, const int argc, const char *argv[]) {
+    char *endptr;
+    const int device = strtol(argv[1], &endptr, 10);
+    if (*endptr != '\0' || device < 0 || device >= ARRAY_SIZE(adi_devs)) {
+        shell_print(shell, "Invalid device number: %s", argv[1]);
+        return -EINVAL;
+    }
+
+    const adi_tmc2209_init_check_t *check = adi_tmc2209_get_init_check(adi_devs[device]);
+    shell_print(shell, "Init check: %s (faults 0x%X)", check->faults == 0 ? "PASS" : "FAIL", check->faults);
+    shell_print(shell, "  IFCNT: %u -> %u, %u writes sent", check->ifcnt_before, check->ifcnt_after,
+                check->writes_sent);
+    shell_print(shell, "  GCONF: wrote 0x%08X, read 0x%08X", check->gconf_written.as_uint32,
+                check->gconf_read.as_uint32);
+    shell_print(shell, "  CHOPCONF: wrote 0x%08X, read 0x%08X (vsense %d)", check->chopconf_written.as_uint32,
+                check->chopconf_read.as_uint32, check->chopconf_read.chopconf.vsense);
+    shell_print(shell, "  IHOLD_IRUN: wrote 0x%08X (irun %d, ihold %d), write-only, read 0x%08X",
+                check->ihold_irun_written.as_uint32, check->ihold_irun_written.ihold_irun.irun,
+                check->ihold_irun_written.ihold_irun.ihold, check->ihold_irun_read.as_uint32);
+
+    return 0;
+}
+
 static int cmd_read_register(const struct shell *shell, const int argc, const char *argv[]) {
     if (argc < 3) {
         shell_print(shell, "Usage: %s <device> 0x<register>", argv[0]);
@@ -388,6 +411,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(subcmds, SHELL_CMD_ARG(read, NULL, "Read a regist
                                SHELL_CMD_ARG(write, NULL, "Write a register", cmd_write_register, 4, 0),
                                SHELL_CMD_ARG(dump, NULL, "Dump all registers", cmd_dump_registers, 2, 0),
                                SHELL_CMD_ARG(dump_otp, NULL, "Dump the OTP memory", cmd_dump_otp, 2, 0),
+                               SHELL_CMD_ARG(init_check, NULL, "Show the configuration check run at init",
+                                             cmd_init_check, 2, 0),
                                SHELL_SUBCMD_SET_END);
 
 SHELL_CMD_REGISTER(adi_tmc2209, &subcmds, "TMC2209 register access", NULL);

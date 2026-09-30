@@ -77,6 +77,8 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .def("ServoDetach", &JerryCAN::ServoDetach, py::arg("dst_id"), py::arg("motor_id"), py::call_guard<py::gil_scoped_release>())
         .def("StepperHome", &JerryCAN::StepperHome, py::arg("dst_id"), py::arg("motor_id"), py::arg("uuid"),
              py::call_guard<py::gil_scoped_release>())
+        .def("StepperFaultClear", &JerryCAN::StepperFaultClear, py::arg("dst_id"), py::arg("motor_id"), py::arg("uuid"),
+             py::call_guard<py::gil_scoped_release>())
         .def("StepperCfgWrite", &JerryCAN::StepperCfgWrite, py::arg("dst_id"), py::arg("motor_id"), py::arg("microsteps"), py::arg("steps_per_revolution"), py::arg("motor_max_velocity"), py::arg("motor_max_acceleration"), py::arg("homing_velocity"), py::arg("flip_limit_orientation"), py::arg("uuid"),
              py::call_guard<py::gil_scoped_release>())
         .def("ServoCfgWrite", &JerryCAN::ServoCfgWrite, py::arg("dst_id"), py::arg("motor_id"), py::arg("min_position"), py::arg("max_position"), py::arg("min_pwm_duration_us"), py::arg("max_pwm_duration_us"), py::arg("motor_max_velocity"), py::arg("motor_max_acceleration"), py::arg("uuid"),
@@ -107,6 +109,7 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .def_readwrite("stepper_move", &jerrycan_msg_t::stepper_move)
         .def_readwrite("servo_move", &jerrycan_msg_t::servo_move)
         .def_readwrite("stepper_home", &jerrycan_msg_t::stepper_home)
+        .def_readwrite("stepper_fault_clear", &jerrycan_msg_t::stepper_fault_clear)
         .def_readwrite("cfg_response", &jerrycan_msg_t::cfg_response)
         .def_readwrite("cfg_read", &jerrycan_msg_t::cfg_read)
         .def_readwrite("cfg_write", &jerrycan_msg_t::cfg_write)
@@ -281,6 +284,11 @@ PYBIND11_MODULE(pyjerrycan, m) {
             [](jerrycan_cmd_stepper_home_t &a, const uint8_t v) { a.motor_id = v; })
     ;
 
+    py::class_<jerrycan_cmd_stepper_fault_clear_t>(m, "StepperFaultClear")
+        .def(py::init<>())
+        .def_readwrite("motor_id", &jerrycan_cmd_stepper_fault_clear_t::motor_id)
+    ;
+
     py::class_<jerrycan_cmd_stepper_status_t>(m, "StepperStatus")
         .def(py::init<>())
         .def_readwrite("motor_id", &jerrycan_cmd_stepper_status_t::motor_id)
@@ -289,6 +297,17 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .def_readwrite("position", &jerrycan_cmd_stepper_status_t::position)
         .def_readwrite("send_position", &jerrycan_cmd_stepper_status_t::send_position)
         .def_readwrite("limit_switch", &jerrycan_cmd_stepper_status_t::limit_switch)
+    ;
+
+    py::enum_<jerrycan_stepper_status_flags_t>(m, "StepperStatusFlag", py::arithmetic())
+        .value("DRIVER_UART_FAULT", JERRYCAN_STEPPER_STATUS_DRIVER_UART_FAULT)
+        .value("DRIVER_WRITE_LOST", JERRYCAN_STEPPER_STATUS_DRIVER_WRITE_LOST)
+        .value("DRIVER_READBACK_FAULT", JERRYCAN_STEPPER_STATUS_DRIVER_READBACK_FAULT)
+        .value("OVERTEMP_WARNING", JERRYCAN_STEPPER_STATUS_OVERTEMP_WARNING)
+        .value("OVERTEMP", JERRYCAN_STEPPER_STATUS_OVERTEMP)
+        .value("MOVE_TIMEOUT", JERRYCAN_STEPPER_STATUS_MOVE_TIMEOUT)
+        .value("DRIVER_COMM_LOST", JERRYCAN_STEPPER_STATUS_DRIVER_COMM_LOST)
+        .value("DRIVER_DISABLED", JERRYCAN_STEPPER_STATUS_DRIVER_DISABLED)
     ;
 
     py::class_<jerrycan_cmd_servo_status_t>(m, "ServoStatus")
@@ -424,6 +443,7 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .value("SERVO_ATTACH", JERRYCAN_CMD_SERVO_ATTACH)
         .value("SERVO_DETACH", JERRYCAN_CMD_SERVO_DETACH)
         .value("STEPPER_HOME", JERRYCAN_CMD_STEPPER_HOME)
+        .value("STEPPER_FAULT_CLEAR", JERRYCAN_CMD_STEPPER_FAULT_CLEAR)
         .value("CFG_WRITE", JERRYCAN_CMD_CFG_WRITE)
         .value("CFG_READ", JERRYCAN_CMD_CFG_READ)
         .value("CFG_RESPONSE", JERRYCAN_CMD_CFG_RESPONSE)

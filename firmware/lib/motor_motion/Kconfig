@@ -43,3 +43,39 @@ config LIB_MOTOR_MOTION_WORK_QUEUE_STACK_SIZE
 config LIB_MOTOR_MOTION_SETTINGS_WORK_QUEUE_STACK_SIZE
   int "Settings work queue thread stack size"
   default 0
+
+config LIB_MOTOR_MOTION_STEPPER_MONITOR_PRIORITY
+  int "Thread priority for the stepper protection monitor"
+  default 5
+  help
+    The monitor polls each moving stepper's driver over its UART (about 10 ms per read), so it runs on its
+    own work queue, below the motion work queue that refills the step buffers.
+
+config LIB_MOTOR_MOTION_STEPPER_MONITOR_STACK_SIZE
+  int "Stepper protection monitor thread stack size"
+  default 1024
+
+config LIB_MOTOR_MOTION_STEPPER_MOVE_TIMEOUT_PERCENT
+  int "Stepper move timeout, as a percentage of the nominal move time"
+  default 150
+  range 100 1000
+  help
+    A stepper move faults if it hasn't finished within this percentage of its nominal duration,
+    distance / velocity + 2 * velocity / acceleration, plus LIB_MOTOR_MOTION_STEPPER_MOVE_TIMEOUT_MARGIN_MS.
+
+config LIB_MOTOR_MOTION_STEPPER_MOVE_TIMEOUT_MARGIN_MS
+  int "Stepper move timeout margin (ms)"
+  default 500
+  range 0 60000
+  help
+    Fixed time added to every stepper move and homing timeout, so short moves aren't timed too tightly.
+
+config LIB_MOTOR_MOTION_STEPPER_HOMING_MAX_TRAVEL
+  int "Longest distance a stepper can travel while homing"
+  default 40
+  range 1 10000
+  help
+    In the same units as move positions, which the host's steps_per_revolution setting defines (millimetres
+    on the pellet module). Homing stops stepping once it has covered this distance and faults with a move
+    timeout if it hasn't reached the limit switch. It is also timed like a move of this distance at the homing
+    velocity and the motor's maximum acceleration, in case the steps stall.

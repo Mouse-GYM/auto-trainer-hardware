@@ -83,6 +83,7 @@ static uint8_t jerrycan_msg_get_payload_size(const jerrycan_cmd_type_t msg_type)
         {JERRYCAN_CMD_SERVO_ATTACH, sizeof(jerrycan_cmd_servo_attach_t)},
         {JERRYCAN_CMD_SERVO_DETACH, sizeof(jerrycan_cmd_servo_detach_t)},
         {JERRYCAN_CMD_STEPPER_HOME, sizeof(jerrycan_cmd_stepper_home_t)},
+        {JERRYCAN_CMD_STEPPER_FAULT_CLEAR, sizeof(jerrycan_cmd_stepper_fault_clear_t)},
         {JERRYCAN_CMD_CFG_WRITE, sizeof(jerrycan_cmd_cfg_t)},
         {JERRYCAN_CMD_CFG_RESPONSE, sizeof(jerrycan_cmd_cfg_t)},
         {JERRYCAN_CMD_CFG_READ, sizeof(jerrycan_cmd_cfg_t)},
@@ -317,6 +318,23 @@ int JerryCAN::StepperHome(const uint8_t dst_id, const uint8_t motor_id, const uu
     jerrycan_msg_t msg = {
         .type = JERRYCAN_CMD_STEPPER_HOME,
         .stepper_home =
+            {
+                .motor_id = motor_id,
+            },
+    };
+
+    msg.uuid = uuid;
+
+    return SendMessage(msg, dst_id);
+}
+
+/* -------------------------------------------------------------------------- */
+
+int JerryCAN::StepperFaultClear(const uint8_t dst_id, const uint8_t motor_id, const uuid_t uuid) const {
+    // Send a stepper fault clear message
+    jerrycan_msg_t msg = {
+        .type = JERRYCAN_CMD_STEPPER_FAULT_CLEAR,
+        .stepper_fault_clear =
             {
                 .motor_id = motor_id,
             },
