@@ -153,8 +153,9 @@ int ll_load_cell_tare(const struct device *dev) {
     ll_load_cell_data_t *data = dev->data;
 
     /* Submit I2C work item to the system workqueue */
-    const int ret = k_work_submit(&data->tare_i2c_work);
-    return k_work_error_handler(ret);
+    const int ret = k_work_error_handler(k_work_submit(&data->tare_i2c_work));
+    // k_work_submit returns 0, 1 or 2 when the work is (or already was) queued; only negatives are errors.
+    return ret < 0 ? ret : 0;
 }
 
 /* Initialize NAU7802 24-bit ADC */

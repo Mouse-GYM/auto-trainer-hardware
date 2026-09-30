@@ -74,6 +74,18 @@ int ll_servo_dma_stop(const struct device *dev) {
     return dma_stop(cfg->dma_dev, data->dma_channel);
 }
 
+int ll_servo_abort(const struct device *dev) {
+    const ll_motor_cfg_t *cfg = dev->config;
+
+    // With interrupts locked the DMA callback can't reload a block between the stop and the purge.
+    const unsigned int key = irq_lock();
+    const int ret = ll_servo_dma_stop(dev);
+    k_msgq_purge(cfg->msgq);
+    irq_unlock(key);
+
+    return ret;
+}
+
 #define SERVO_INST(idx)                                                                             \
     PINCTRL_DT_INST_DEFINE(idx);                                                                    \
                                                                                                     \

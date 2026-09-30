@@ -64,6 +64,9 @@ static int stepper_start_move(struct stepper_work_context *context, float target
 #define STEPPER_DEFAULT_FLIP_LIMIT_ORIENTATION false
 // Default 'micro_steps' of stepper
 #define STEPPER_DEFAULT_MICRO_STEPS 1
+// Fewest step-timer ticks between pulses a move or homing may ask for. The timing generator replaces anything at or
+// below one tick with a fixed fast interval, flattening the ramp, so velocities are kept well clear of that.
+#define STEPPER_MIN_PULSE_TICKS 4.0f
 
 #define DEV_DEFINE_SERVO_CONTEXT(id)                                                         \
     {.dev = DEVICE_DT_GET(id),                                                               \
@@ -248,6 +251,15 @@ struct stepper_work_context *find_stepper_context_from_device(const struct devic
     return NULL;
 }
 
+/**
+ * The highest velocity the step timer can produce at `context`'s microstep and steps-per-revolution settings,
+ * leaving STEPPER_MIN_PULSE_TICKS between pulses.
+ */
+static float stepper_max_timer_velocity(const struct stepper_work_context *context) {
+    return 1.0f / (STEPPER_MIN_PULSE_TICKS * context->timer_increment * context->motor_steps_per_revolution *
+                   (float)context->microsteps);
+}
+
 void stepper_set_position_to_zero(const struct device *dev) {
     struct stepper_work_context *context = find_stepper_context_from_device(dev);
     if (context == NULL) {
@@ -392,6 +404,9 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
                             (context->motor_direction == LL_STEPPER_DIR_FORWARD && context->flip_limit_orientation)) {
                             LOG_WRN("Found Limit Switch. Stopping Motor.");
                             stepper_motor_stop(dev);
+                            // Homing puts 0 where the switch closes, so that is where the carriage is now, however
+                            // far the move had planned (and `last_position_generated` had run) ahead of it.
+                            motor_motion_stepper_set_current_position(&context->context, 0.0f);
                         }
                         break;
                 }
@@ -476,6 +491,11 @@ static void servo_work_calculation_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct servo_work_context *context = CONTAINER_OF(dwork, struct servo_work_context, calculation_work);
 
+    // The servo was stopped after this refill was scheduled; queuing a block now would restart the DMA.
+    if (context->motion_calculation_done) {
+        return;
+    }
+
     const ssize_t ret = motor_motion_servo_generate_displacement_table(context->buffers[context->current_buffer],
                                                                        SERVO_BUFFER_SIZE, &context->context);
     context->last_calculation_ret = ret;
@@ -486,7 +506,7 @@ static void servo_work_calculation_handler(struct k_work *work) {
 
     // Entire buffer wasn't needed which indicates all the steps have been planned and no more calculations are required
     // If nothing was calculated, then the motor is already at the target position
-    if (ret < STEPPER_BUFFER_SIZE) {
+    if (ret < SERVO_BUFFER_SIZE) {
         context->motion_calculation_done = true;
     }
 
@@ -501,17 +521,20 @@ static void servo_work_calculation_handler(struct k_work *work) {
 size_t stepper_generate_table_for_homing(const struct stepper_work_context *context, uint32_t *buf) {
     const float slow_pulses_ms = 100.0f;
 
+    const float homing_velocity = MIN(context->homing_velocity, stepper_max_timer_velocity(context));
     const float seconds_per_pulse =
-        1 / context->homing_velocity / context->motor_steps_per_revolution * context->context.min_step;
+        1 / homing_velocity / context->motor_steps_per_revolution * context->context.min_step;
 
+    // At least one pulse: an empty block would never raise the event that queues the next one.
     size_t n_pulses = (size_t)floorf(slow_pulses_ms / 1000.0f / seconds_per_pulse);
+    n_pulses = CLAMP(n_pulses, 1, STEPPER_BUFFER_SIZE);
 
-    if (n_pulses > STEPPER_BUFFER_SIZE) {
-        n_pulses = STEPPER_BUFFER_SIZE;
-    }
-
+    // The timer's reload register is 16 bits: a longer interval would be truncated into a much shorter one. The
+    // velocity limit above already meets the lower bound; it's repeated so no entry can be 0, which stops the timer.
+    const long ticks = CLAMP(lroundf(seconds_per_pulse / context->timer_increment), (long)STEPPER_MIN_PULSE_TICKS,
+                             (long)UINT16_MAX);
     for (size_t i = 0; i < n_pulses; i++) {
-        buf[i] = lroundf(seconds_per_pulse / context->timer_increment);
+        buf[i] = (uint32_t)ticks;
     }
 
     return n_pulses;
@@ -619,8 +642,8 @@ static int64_t stepper_move_timeout_ms(const float distance, const float velocit
 }
 
 /**
- * Start polling a move that has just started. Safe to call from ISRs: the fixed-XYZ sequence starts moves from a
- * timer. `move_deadline_ms` must already be set, before `motion_mode` became MOTION_IN_PROGESS.
+ * Start polling a move that has just started. Safe to call from ISRs. `move_deadline_ms` must already be set,
+ * before `motion_mode` became MOTION_IN_PROGESS.
  */
 static void stepper_monitor_start(struct stepper_work_context *context) {
     k_work_reschedule_for_queue(&stepper_monitor_workq, &context->check_driver_work,
@@ -911,6 +934,11 @@ int servo_move_to_position(const struct device *dev, float target_position, cons
         return -EBUSY;
     }
 
+    if (e_stop_engaged()) {
+        LOG_ERR("Attempted to move servo while the e-stop is engaged");
+        return -ECANCELED;
+    }
+
     if (max_acceleration > context->motor_max_acceleration) {
         LOG_WRN("Max acceleration greater than that of the motor, using lower value.");
     }
@@ -995,6 +1023,40 @@ int stepper_set_parameters(const struct device *dev, const float max_velocity, c
         return -ENODEV;
     }
 
+    // The queued step timings were planned with the current settings, and the limit-switch stop reads
+    // `flip_limit_orientation`, so nothing may change underneath a move.
+    if (context->motion_mode == MOTION_IN_PROGESS) {
+        LOG_ERR("Refusing stepper configuration while the motor is moving");
+        return -EBUSY;
+    }
+
+    // Validate everything before changing anything. A value <= 0 (or NaN) means "unchanged"; +Inf is rejected.
+    if ((max_velocity > 0.0f && !isfinite(max_velocity)) || (max_acceleration > 0.0f && !isfinite(max_acceleration)) ||
+        (homing_velocity > 0.0f && !isfinite(homing_velocity)) ||
+        (steps_per_revolution > 0.0f && !isfinite(steps_per_revolution))) {
+        LOG_ERR("Refusing non-finite stepper configuration");
+        return -EINVAL;
+    }
+
+    // The TMC2209 takes only powers of two up to 256.
+    if (microsteps > 0 && (microsteps > 256 || (microsteps & (microsteps - 1)) != 0)) {
+        LOG_ERR("Invalid microsteps %u: must be a power of two from 1 to 256", microsteps);
+        return -EINVAL;
+    }
+
+    // Planner and driver must agree on the step size, so the planner takes the new value only once the driver has.
+    if (microsteps > 0) {
+        const struct device *driver = stepper_driver_of(context);
+        if (driver != NULL) {
+            const int ret = adi_tmc2209_set_microstep(driver, microsteps);
+            if (ret < 0) {
+                LOG_ERR("Driver didn't take microsteps %u (%d); keeping %u", microsteps, ret, context->microsteps);
+                return ret;
+            }
+        }
+        context->microsteps = microsteps;
+    }
+
     if (max_velocity > 0.0f) {
         context->motor_max_velocity = max_velocity;
     }
@@ -1005,12 +1067,6 @@ int stepper_set_parameters(const struct device *dev, const float max_velocity, c
 
     if (homing_velocity > 0.0f) {
         context->homing_velocity = homing_velocity;
-    }
-
-    if (microsteps > 0) {
-        context->microsteps = microsteps;
-        const ll_motor_cfg_t *stepper_config = dev->config;
-        adi_tmc2209_set_microstep(stepper_config->stepper_driver_device, microsteps);
     }
 
     if (steps_per_revolution > 0.0f) {
@@ -1024,6 +1080,11 @@ int stepper_set_parameters(const struct device *dev, const float max_velocity, c
 }
 
 int stepper_save_fixed_location(struct stepper_work_context *context, const int motor_id, const float position, const bool is_absolute) {
+    if (!isfinite(position)) {
+        LOG_ERR("Refusing non-finite fixed position");
+        return -EINVAL;
+    }
+
     if (is_absolute) {
         context->fixed_position = position;
     } else {
@@ -1057,6 +1118,11 @@ int stepper_move_to_position(const struct device *dev, const float target_positi
         return -EBUSY;
     }
 
+    if (e_stop_engaged()) {
+        LOG_ERR("Attempted to move while the e-stop is engaged");
+        return -ECANCELED;
+    }
+
     if (atomic_get(&context->fault) != 0) {
         LOG_ERR("Attempted to move with fault 0x%lX latched", atomic_get(&context->fault));
         return -EPERM;
@@ -1068,7 +1134,10 @@ int stepper_move_to_position(const struct device *dev, const float target_positi
     }
     atomic_flag_clear(&context->e_stop_triggered);
 
-    if (fabsf(target_position - context->context.last_position_generated) < 1.0f / context->microsteps) {
+    // Each step pulse moves 1 / (microsteps * steps_per_revolution) position units; a shorter move has no pulses.
+    const float pulses = fabsf(target_position - context->context.last_position_generated) *
+                         context->motor_steps_per_revolution * (float)context->microsteps;
+    if (pulses < 1.0f) {
         LOG_WRN("Target position is the same as current position.");
         return -EAGAIN;
     }
@@ -1104,7 +1173,13 @@ static int stepper_start_move(struct stepper_work_context *context, const float 
     }
 
     const float movement_max_a = MIN(context->motor_max_acceleration, max_acceleration);
-    const float movement_max_v = MIN(context->motor_max_velocity, max_velocity);
+    float movement_max_v = MIN(context->motor_max_velocity, max_velocity);
+    const float timer_max_v = stepper_max_timer_velocity(context);
+    if (movement_max_v > timer_max_v) {
+        LOG_WRN("Velocity %f is beyond what the step timer can produce at %u microsteps; using %f",
+                (double)movement_max_v, context->microsteps, (double)timer_max_v);
+        movement_max_v = timer_max_v;
+    }
     const float distance = fabsf(target_position - context->context.last_position_generated);
     const int ret = motor_motion_stepper_init_context_struct(
         context->context.last_position_generated, target_position, movement_max_v, movement_max_a, context->microsteps,
@@ -1120,6 +1195,7 @@ static int stepper_start_move(struct stepper_work_context *context, const float 
     context->drv_status_read_failures = 0;
     context->homing_travel_exhausted = false;
 
+    const motion_mode_t prev_motion_mode = context->motion_mode;
     context->motion_mode = MOTION_IN_PROGESS;
     context->move_control = MOVING_POSITION;
     context->motion_calculation_done = false;
@@ -1132,6 +1208,14 @@ static int stepper_start_move(struct stepper_work_context *context, const float 
         const ssize_t gen_table_ret =
             motor_motion_stepper_generate_timing_table(context->buffers[i], STEPPER_BUFFER_SIZE, &context->context);
         context->last_calculation_ret = gen_table_ret;
+
+        // Nothing was queued, so no DMA event will ever end this move; don't leave it in progress.
+        if (i == 0 && gen_table_ret <= 0) {
+            LOG_ERR("Stepper move generated no pulses (%d)", gen_table_ret);
+            context->motion_calculation_done = true;
+            context->motion_mode = prev_motion_mode;
+            return gen_table_ret < 0 ? gen_table_ret : -EAGAIN;
+        }
 
         // Error out if calculation didn't succeed
         if (gen_table_ret < 0) {
@@ -1176,6 +1260,11 @@ int stepper_home(const struct device *dev) {
 
     const ll_motor_cfg_t *cfg = dev->config;
 
+    if (e_stop_engaged()) {
+        LOG_ERR("Attempted to home while the e-stop is engaged");
+        return -ECANCELED;
+    }
+
     if (atomic_get(&work_context->fault) != 0) {
         LOG_ERR("Attempted to home with fault 0x%lX latched", atomic_get(&work_context->fault));
         return -EPERM;
@@ -1215,7 +1304,7 @@ int stepper_home(const struct device *dev) {
     // Ramp up as a move does, over a displacement long enough to reach the homing velocity; after the ramp,
     // `stepper_generate_homing_block` holds that velocity until the limit switch. Homing heads toward position
     // 0, so the profile runs down from the current position.
-    const float homing_v = work_context->homing_velocity;
+    const float homing_v = MIN(work_context->homing_velocity, stepper_max_timer_velocity(work_context));
     const float homing_a = work_context->motor_max_acceleration;
     const float ramp_start = context->last_position_generated;
     const int ramp_ret = motor_motion_stepper_init_context_struct(
@@ -1351,8 +1440,61 @@ void set_all_e_stop_flags(void) {
     }
 
     for (size_t i = 0; i < ARRAY_SIZE(servo_contexts); i++) {
-        atomic_flag_test_and_set(&stepper_contexts[i].e_stop_triggered);
+        atomic_flag_test_and_set(&servo_contexts[i].e_stop_triggered);
     }
+}
+
+void stepper_e_stop(const struct device *dev) {
+    struct stepper_work_context *context = find_stepper_context_from_device(dev);
+    if (context == NULL) {
+        return;
+    }
+
+    // Claim the move before stopping it, so a DMA or limit-switch event can't report it as done, and stop any
+    // refill or homing verification step from starting another.
+    const unsigned int key = irq_lock();
+    context->motion_calculation_done = true;
+    context->homing_verify = HOMING_VERIFY_NONE;
+    if (context->motion_mode == MOTION_IN_PROGESS) {
+        context->homing_error = -ECANCELED;
+        context->motion_mode = MOTION_FAULT;
+    }
+    irq_unlock(key);
+
+    ll_stepper_abort(dev);
+
+    struct k_work_sync sync;
+    k_work_cancel_delayable_sync(&context->calculation_work, &sync);
+    k_work_cancel_delayable_sync(&context->homing_verify_work, &sync);
+    // A refill or verification move that was already running may have queued a block and restarted the DMA.
+    ll_stepper_abort(dev);
+
+    // The carriage stopped short of wherever the move had planned to, so the position needs homing again.
+    atomic_flag_test_and_set(&context->e_stop_triggered);
+}
+
+void servo_e_stop(const struct device *dev) {
+    struct servo_work_context *context = find_servo_context_from_device(dev);
+    if (context == NULL) {
+        return;
+    }
+
+    const unsigned int key = irq_lock();
+    context->motion_calculation_done = true;
+    if (context->motion_mode == MOTION_IN_PROGESS) {
+        context->motion_mode = MOTION_FAULT;
+    }
+    irq_unlock(key);
+
+    ll_servo_abort(dev);
+
+    struct k_work_sync sync;
+    k_work_cancel_delayable_sync(&context->calculation_work, &sync);
+    // A refill that was already running may have queued a block and restarted the DMA.
+    ll_servo_abort(dev);
+
+    // The horn stopped somewhere inside the block that was playing, not at `known_position`.
+    context->position_valid = false;
 }
 
 movement_control_t stepper_homing_status(const struct device *dev) {

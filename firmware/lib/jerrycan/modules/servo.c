@@ -60,6 +60,9 @@ static int servo_handler(const jerrycan_msg_t *msg) {
     if (!context) {
         rc = -ENOENT;
     } else {
+        // Claim the completion before starting, in case the move finishes first; give it back if the move doesn't
+        // start, so a move already running keeps its own uuid.
+        const uint8_t prev_uuid = context->uuid;
         context->uuid = msg->uuid;
 
         switch (msg->servo_move.abs_or_rel) {
@@ -79,6 +82,10 @@ static int servo_handler(const jerrycan_msg_t *msg) {
                 rc = -EINVAL;
                 LOG_ERR("Invalid move type: %d", msg->servo_move.abs_or_rel);
                 break;
+        }
+
+        if (rc != 0) {
+            context->uuid = prev_uuid;
         }
     }
 
@@ -211,6 +218,10 @@ static void jerrycan_servo_status_tx() {
 
         if (context->motion_mode == MOTION_DONE) {
             jerrycan_send_ack(context->uuid, 0);
+            context->motion_mode = MOTION_IDLE;
+        } else if (context->motion_mode == MOTION_FAULT) {
+            // The e-stop stopped this move short of its target.
+            jerrycan_send_ack(context->uuid, -ECANCELED);
             context->motion_mode = MOTION_IDLE;
         }
 

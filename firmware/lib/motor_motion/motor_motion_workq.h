@@ -17,8 +17,9 @@
 typedef uint32_t servo_buffer_set[BUFS_PER_MOTOR][SERVO_BUFFER_SIZE];
 typedef uint32_t stepper_buffer_set[BUFS_PER_MOTOR][STEPPER_BUFFER_SIZE];
 
-// MOTION_FAULT: a stepper move was aborted by the protection monitor. The CAN layer acks it with
-// `stepper_fault_error` and returns it to MOTION_IDLE, as it does for MOTION_DONE.
+// MOTION_FAULT: a move was aborted: a stepper's by the protection monitor, a failed homing verification or the
+// e-stop; a servo's by the e-stop. The CAN layer acks it with an error (`stepper_motion_error` for a stepper,
+// -ECANCELED for a servo) and returns it to MOTION_IDLE, as it does for MOTION_DONE.
 typedef enum { MOTION_IDLE, MOTION_IN_PROGESS, MOTION_DONE, MOTION_FAULT } motion_mode_t;
 
 // Stepper protection faults (`stepper_work_context.fault`). Latched until `stepper_clear_fault`.
@@ -97,8 +98,8 @@ struct stepper_work_context {
     // monitor turns it into a fault.
     bool homing_travel_exhausted;
     _Atomic homing_verify_t homing_verify;
-    // The error homing ended with when it didn't get past the verification (MOTION_FAULT with no `fault` bit),
-    // 0 otherwise.
+    // Why a move or homing ended in MOTION_FAULT when no `fault` bit explains it: the homing verification's error,
+    // or -ECANCELED for the e-stop. 0 otherwise.
     int homing_error;
     struct k_work_delayable calculation_work;
     struct k_work_delayable check_driver_work;
@@ -158,9 +159,12 @@ int servo_move_relative(const struct device *dev, float delta_position, float ma
 /**
  * These parameters are usually constant across movements of the motor, so we abstract them to a
  * separate function. If any of these parameters have values lower than or equal to 0.0f,
- * it is unchanged.
+ * it is unchanged. Nothing changes unless the whole configuration is accepted.
  *
  * @retval -ENODEV if the device is not found among the static context structs.
+ * @retval -EBUSY if the motor is moving.
+ * @retval -EINVAL for a non-finite value, or microsteps that aren't a power of two from 1 to 256.
+ * @retval -errno if the driver didn't take the microstep setting.
  */
 int stepper_set_parameters(const struct device *dev, float motor_max_velocity, float motor_max_acceleration,
                            float homing_velocity, uint16_t microsteps, float motor_steps_per_revolution,
@@ -181,9 +185,14 @@ int stepper_save_fixed_location(struct stepper_work_context *context, int motor_
  * DRV_STATUS is polled; on otpw or ot, or if the move outlasts its timeout (proportional to the distance), the
  * move is aborted, the driver is disabled, and `motion_mode` becomes MOTION_FAULT.
  *
+ * The velocity is capped at what the step timer can produce at the current microstep setting.
+ *
  * @retval -ENODEV if the device is not found in the list.
- * @retval -EBUSY if another motion profile is already running.
+ * @retval -EBUSY if another motion profile is already running, or the motor must be homed after an e-stop or a
+ *         failed homing.
+ * @retval -ECANCELED if the e-stop is engaged.
  * @retval -EPERM if a protection fault is latched; see `stepper_clear_fault`.
+ * @retval -EAGAIN if the target is less than one step pulse away.
  */
 int stepper_move_to_position(const struct device *dev, float target_position, float max_velocity,
                              float max_acceleration);
@@ -307,6 +316,19 @@ int servo_read_config(const struct device *dev, servo_config_t *config);
  * unless the homing procedure is followed.
  */
 void set_all_e_stop_flags(void);
+
+/**
+ * E-stop one stepper: stop the pulses, drop queued blocks and cancel refills and homing verification. A move or
+ * homing in progress ends in MOTION_FAULT with -ECANCELED, and the motor must be homed before it moves again.
+ * Blocks until running work items finish; don't call from an ISR.
+ */
+void stepper_e_stop(const struct device *dev);
+
+/**
+ * E-stop one servo: stop the pulse-width updates and drop queued blocks, so the horn holds where it is. A move in
+ * progress ends in MOTION_FAULT. Blocks until a running refill finishes; don't call from an ISR.
+ */
+void servo_e_stop(const struct device *dev);
 
 /**
  * @param dev stepper device

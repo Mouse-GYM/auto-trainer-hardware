@@ -28,10 +28,21 @@ void servo_motor_stop(const struct device *dev);
 void motors_all_stop(void);
 
 /*
- * Trigger the emergency stop (e-stop) functionality. Calls `motors_all_stop` and
- * sets the flags in the relevant context structs.
+ * Engage the emergency stop (e-stop): every stepper and servo stops where it is (`stepper_e_stop`,
+ * `servo_e_stop`), and moves and homing are refused with -ECANCELED until `release_e_stop`. Steppers then also
+ * need homing before they move again. Blocks briefly for running work items; don't call from an ISR.
  */
 void trigger_e_stop(void);
+
+/*
+ * Release the e-stop, so servos can move and steppers can home again.
+ */
+void release_e_stop(void);
+
+/*
+ * @return whether the e-stop is engaged. Safe to call from ISRs.
+ */
+bool e_stop_engaged(void);
 
 /*
  * Get the stepper motor device by its ID. This is useful for the shell commands and CAN commands.

@@ -192,11 +192,12 @@ static int adi_tmc2209_write(const struct device *dev, const uint8_t reg_address
     }};
     SLEEP_DELAY();
     store_crc(datagram.raw, sizeof(datagram.raw));
-    write_single_line_uart_and_flush_read(dev, datagram.raw, sizeof(datagram.raw));
+    // This only confirms the datagram went out on the wire (its echo came back); the IC doesn't acknowledge writes.
+    const int ret = write_single_line_uart_and_flush_read(dev, datagram.raw, sizeof(datagram.raw));
 
     k_mutex_unlock(&adi_tmc2209_bus_lock);
 
-    return 0;
+    return ret;
 }
 
 /**
@@ -505,7 +506,23 @@ static int adi_tmc2209_set_mres(const struct device *dev, const uint32_t steps_p
 
     val.chopconf.mres = mres;
     ret = adi_tmc2209_write(dev, REG_CHOPCONF, val);
-    return ret;
+    if (ret < 0) {
+        LOG_ERR("[Dev: %d] Failed (%d) to write chopconf", config->address, ret);
+        return ret;
+    }
+
+    // The planner's step size must match the IC's, so confirm the IC took it.
+    ret = adi_tmc2209_read(dev, REG_CHOPCONF, &val);
+    if (ret < 0) {
+        LOG_ERR("[Dev: %d] Failed (%d) to read back chopconf", config->address, ret);
+        return ret;
+    }
+    if (val.chopconf.mres != mres) {
+        LOG_ERR("[Dev: %d] mres read back %d, wrote %d", config->address, val.chopconf.mres, mres);
+        return -EIO;
+    }
+
+    return 0;
 }
 
 int adi_tmc2209_set_microstep(const struct device *dev, const uint32_t steps_per_fullstep) {

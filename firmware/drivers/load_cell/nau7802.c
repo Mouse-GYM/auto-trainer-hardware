@@ -4,6 +4,12 @@
 
 LOG_MODULE_REGISTER(nau7802_chip, CONFIG_LL_LOAD_CELL_LOG_LEVEL);
 
+/* Bounds on the status-bit polling loops, so a chip that ACKs but never sets PUR or clears CALS can't hang boot or
+ * the system workqueue. Calibration runs over several conversions, so it gets enough time for the slowest rate. */
+#define NAU7802_POWER_UP_TIMEOUT_MS 500
+#define NAU7802_CALIBRATION_TIMEOUT_MS 2000
+#define NAU7802_POLL_INTERVAL_MS 1
+
 /* Read the specified NAU7802 Register into the given NAU7802 Register Structure */
 static int nau7802_read(const struct i2c_dt_spec *i2c, nau7802_reg_address_t reg, nau7802_reg_t *value) {
     return i2c_reg_read_byte_dt(i2c, reg, &value->byte);
@@ -57,14 +63,20 @@ int nau7802_power_sequence(const struct i2c_dt_spec *i2c) {
     }
 
     /* Wait until power up */
+    const int64_t deadline = k_uptime_get() + NAU7802_POWER_UP_TIMEOUT_MS;
     do {
         ret = nau7802_read(i2c, NAU7802_PU_CTRL, (nau7802_reg_t *)&pu_ctrl);
         if (ret != 0) {
             return ret;
         }
-    } while (!pu_ctrl.pur);
+        if (pu_ctrl.pur) {
+            return 0;
+        }
+        k_msleep(NAU7802_POLL_INTERVAL_MS);
+    } while (k_uptime_get() < deadline);
 
-    return 0;
+    LOG_ERR("Timed out waiting for power-up ready");
+    return -ETIMEDOUT;
 }
 
 int nau7802_power_up(const struct i2c_dt_spec *i2c) {
@@ -349,17 +361,27 @@ int nau7802_calibrate(const struct i2c_dt_spec *i2c) {
     /* Wait for calibration to finish */
     /**********************************/
 
-    do {
+    const int64_t deadline = k_uptime_get() + NAU7802_CALIBRATION_TIMEOUT_MS;
+    while (true) {
         /* Read current value of CTRL2 register */
         ret = nau7802_read(i2c, NAU7802_CTRL2, (nau7802_reg_t *)&ctrl2);
         if (ret != 0) {
             return ret;
         }
         /* Exit loop when CALS bit goes low */
-    } while (ctrl2.cals);
+        if (!ctrl2.cals) {
+            break;
+        }
+        if (k_uptime_get() >= deadline) {
+            LOG_ERR("Timed out waiting for calibration to finish");
+            ret = -ETIMEDOUT;
+            break;
+        }
+        k_msleep(NAU7802_POLL_INTERVAL_MS);
+    }
 
     /* If calibration error occurred return -EIO */
-    if (ctrl2.cal_err) {
+    if (ret == 0 && ctrl2.cal_err) {
         ret = -EIO;
     }
 

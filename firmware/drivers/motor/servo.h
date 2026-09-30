@@ -13,3 +13,9 @@ int ll_queue_servo_positions(const struct device *dev, uint32_t *positions, size
 int ll_servo_register_callback(const struct device *dev, ll_servo_cb_t *cb);
 int ll_servo_enable(const struct device *dev, bool enable);
 int ll_servo_dma_stop(const struct device *dev);
+/*
+ * Stop a move partway: stop the DMA and drop any blocks still queued, so the next move starts from an empty queue.
+ * The PWM keeps running with the last pulse width, so the servo holds where it is. No DMA_QUEUE_EMPTY event is
+ * raised.
+ */
+int ll_servo_abort(const struct device *dev);

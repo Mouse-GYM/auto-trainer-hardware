@@ -304,6 +304,8 @@ int ll_tone_generator_play_tone(const struct device *dev, unsigned int frequency
     if (frequency_hz < TONE_GENERATOR_MIN_FREQUENCY || frequency_hz > TONE_GENERATOR_MAX_FREQUENCY) {
         LOG_ERR("Invalid frequency <%d> - must reside within the commandable range [%d, %d]", frequency_hz,
                 TONE_GENERATOR_MIN_FREQUENCY, TONE_GENERATOR_MAX_FREQUENCY);
+        // Frequency 0 would divide by zero in the reload calculation below, which traps and halts the module.
+        return -EINVAL;
     }
 
     /* Enable the audio amplifier */

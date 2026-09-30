@@ -65,7 +65,7 @@ typedef enum __attribute__((packed)) {
 } jerrycan_cmd_type_t;
 
 typedef struct __attribute__((packed)) {
-    uint8_t rsvd;
+    uint8_t rsvd;  // Nonzero engages the e-stop, 0 releases it.
 } jerrycan_cmd_estop_t;
 
 SIZE_CHECK(jerrycan_cmd_estop_t, 1);

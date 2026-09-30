@@ -12,6 +12,10 @@ zephyr_library_sources(
 # If this board has the motor motion library enabled, include the stepper and servo files
 # to include the appropriate CAN message handlers
 if (CONFIG_LIB_MOTOR_MOTION)
+	zephyr_library_sources(
+		          modules/estop.c
+	    )
+
 	zephyr_library_sources_ifdef(CONFIG_DT_HAS_LL_SERVO_ENABLED
 		          modules/servo.c
 	    )
