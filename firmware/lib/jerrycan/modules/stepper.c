@@ -180,9 +180,10 @@ static void stepper_handle_motion_complete() {
                 moving_state = MOVING_NONE;
             }
         } else if (context && context->motion_mode == MOTION_FAULT) {
-            // The protection aborted this move. Fail the command it belongs to: a single move or homing, or
-            // whichever leg of the fixed-XYZ sequence was running, which ends the sequence.
-            const int error = stepper_fault_error(stepper_get_fault(dev));
+            // The protection aborted this move, or homing found its limit switch defective. Fail the command it
+            // belongs to: a single move or homing, or whichever leg of the fixed-XYZ sequence was running, which
+            // ends the sequence.
+            const int error = stepper_motion_error(dev);
             LOG_ERR("Motion fault for %d. state=%d. uuid=%d. error=%d", i, moving_state, context->uuid, error);
             context->motion_mode = MOTION_IDLE;
             if (moving_state != MOVING_NONE) {

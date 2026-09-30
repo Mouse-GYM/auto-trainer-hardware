@@ -115,6 +115,10 @@ typedef struct __attribute__((packed)) {
 
 SIZE_CHECK(jerrycan_cmd_stepper_move_t, 13);
 
+// Home a stepper on its limit switch, then verify the switch with a normal move 1 unit (1 mm on the pellet module)
+// away from it, which must release it, and a normal move back to 0. Acked when that is done; the status reports
+// homing_status 0 throughout. -ENXIO, after the move back, if the switch stayed active (defective or stuck):
+// further moves are refused with -EBUSY until homing succeeds.
 typedef struct __attribute__((packed)) {
     uint8_t motor_id : 7;
     uint8_t rsvd : 1;

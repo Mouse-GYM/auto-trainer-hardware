@@ -27,6 +27,10 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
                                          void *user_data);
 #endif
 
+static void stepper_work_homing_verify_handler(struct k_work *work);
+static int stepper_start_move(struct stepper_work_context *context, float target_position, float max_velocity,
+                              float max_acceleration);
+
 /* ***** Static Context Structs Used Throughout ***** */
 
 // Default pwm duration of the minimum angle
@@ -48,6 +52,8 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
 #define STEPPER_DRIVER_CHECK_PERIOD 100U
 // Consecutive failed DRV_STATUS reads during a move before the driver counts as unreachable
 #define STEPPER_DRV_STATUS_READ_FAILURES 3U
+// Pause before each step of the homing verification, so the carriage and the switch contact settle after a stop
+#define STEPPER_HOMING_VERIFY_SETTLE_MS 20U
 // Default 'min_step' of stepper (number of steps, incl. microstepping, done per pulse)
 #define STEPPER_DEFAULT_STEPS_PER_REVOLUTION 48.0f
 // Default 'max_velocity' of stepper
@@ -253,6 +259,36 @@ void stepper_set_position_to_zero(const struct device *dev) {
     context->motion_mode = MOTION_DONE;
 }
 
+/**
+ * Stop at the limit switch, take it as position 0, and have the homing verification take its next step. Safe to
+ * call from ISRs, and again for a bouncing contact.
+ */
+static void stepper_homing_at_switch(struct stepper_work_context *context) {
+    context->motion_calculation_done = true;
+    ll_stepper_abort(context->dev);
+    motor_motion_stepper_set_current_position(&context->context, 0.0f);
+    k_work_schedule_for_queue(&motor_workq, &context->homing_verify_work, K_MSEC(STEPPER_HOMING_VERIFY_SETTLE_MS));
+}
+
+/**
+ * End homing with `error` (0 for success) unless something else, a fault or a stop, ended it first. A failure
+ * leaves the position unproven, so moves are refused until homing succeeds.
+ */
+static void stepper_homing_finish(struct stepper_work_context *context, const int error) {
+    const unsigned int key = irq_lock();
+    if (context->motion_mode == MOTION_IN_PROGESS) {
+        context->homing_error = error;
+        context->motion_mode = error == 0 ? MOTION_DONE : MOTION_FAULT;
+        if (error != 0) {
+            atomic_flag_test_and_set(&context->e_stop_triggered);
+        }
+    }
+    context->homing_verify = HOMING_VERIFY_NONE;
+    // Report homing as the last command, as it was before the verification's moves.
+    context->move_control = MOVING_HOME;
+    irq_unlock(key);
+}
+
 void servo_set_position_to_zero(const struct device *dev) {
     struct servo_work_context *context = find_servo_context_from_device(dev);
     if (context == NULL) {
@@ -306,14 +342,21 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
                     case MOVING_POSITION:
                         // When the driver runs out of data to send, the motion is done
                         if (context->motion_mode == MOTION_IN_PROGESS) {
-                            context->motion_mode = MOTION_DONE;
+                            if (context->homing_verify != HOMING_VERIFY_NONE) {
+                                // A homing verification move ended; homing isn't done until the next step.
+                                k_work_schedule_for_queue(&motor_workq, &context->homing_verify_work,
+                                                          K_MSEC(STEPPER_HOMING_VERIFY_SETTLE_MS));
+                            } else {
+                                context->motion_mode = MOTION_DONE;
+                            }
                         }
                         break;
 
                     case MOVING_HOME:
                         if (!context->motion_calculation_done) {
                             k_work_schedule_for_queue(&motor_workq, &context->calculation_work, K_NO_WAIT);
-                        } else if (context->motion_mode == MOTION_IN_PROGESS) {
+                        } else if (context->motion_mode == MOTION_IN_PROGESS &&
+                                   context->homing_verify == HOMING_VERIFY_NONE) {
                             // Every pulse of the maximum travel went out and the limit switch never stopped
                             // the motor. Disabling the driver needs the UART, so the monitor raises the fault.
                             context->homing_travel_exhausted = true;
@@ -327,11 +370,20 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
             // Context is NULL during this event because of limitations of the GPIO driver
             context = find_stepper_context_from_device(dev);
             if (context && context->motion_mode == MOTION_IN_PROGESS) {
+                if (context->homing_verify == HOMING_VERIFY_RETURN) {
+                    // Back onto the switch: where it closes is home, as when homing first found it.
+                    stepper_homing_at_switch(context);
+                    break;
+                }
+
                 switch (context->move_control) {
                     case MOVING_HOME:
-                        LOG_WRN("Found Limit Switch. Stopping Motor.");
-                        stepper_motor_stop(dev);
-                        stepper_set_position_to_zero(dev);
+                        // Only the first edge counts; the verification that follows ignores contact bounce.
+                        if (context->homing_verify == HOMING_VERIFY_NONE) {
+                            LOG_WRN("Found Limit Switch. Stopping Motor.");
+                            context->homing_verify = HOMING_VERIFY_START;
+                            stepper_homing_at_switch(context);
+                        }
                         break;
 
                     default:
@@ -403,6 +455,8 @@ void stepper_cancel_all_work(const struct device *dev) {
     struct stepper_work_context *context = find_stepper_context_from_device(dev);
     k_work_cancel_delayable(&context->calculation_work);
     k_work_cancel_delayable(&context->check_driver_work);
+    k_work_cancel_delayable(&context->homing_verify_work);
+    context->homing_verify = HOMING_VERIFY_NONE;
 
     if (context->motion_mode == MOTION_IN_PROGESS) {
         context->motion_mode = MOTION_DONE;
@@ -727,6 +781,16 @@ bool stepper_driver_output_disabled(const struct device *dev) {
 
 int stepper_fault_error(const uint32_t fault) { return fault == STEPPER_FAULT_MOVE_TIMEOUT ? -ETIMEDOUT : -EIO; }
 
+int stepper_motion_error(const struct device *dev) {
+    const struct stepper_work_context *context = find_stepper_context_from_device(dev);
+    if (context == NULL) {
+        return -ENODEV;
+    }
+
+    return context->homing_error != 0 ? context->homing_error
+                                      : stepper_fault_error((uint32_t)atomic_get(&context->fault));
+}
+
 /* ***** Initialization ***** */
 static int motor_workq_init_and_start(void) {
     for (size_t i = 0; i < ARRAY_SIZE(stepper_contexts); i++) {
@@ -752,6 +816,7 @@ static int motor_workq_init_and_start(void) {
     for (size_t i = 0; i < ARRAY_SIZE(stepper_contexts); i++) {
         k_work_init_delayable(&stepper_contexts[i].calculation_work, stepper_work_calculation_handler);
         k_work_init_delayable(&stepper_contexts[i].check_driver_work, stepper_work_check_driver_handler);
+        k_work_init_delayable(&stepper_contexts[i].homing_verify_work, stepper_work_homing_verify_handler);
     }
 
     for (size_t i = 0; i < ARRAY_SIZE(servo_contexts); i++) {
@@ -998,7 +1063,7 @@ int stepper_move_to_position(const struct device *dev, const float target_positi
     }
 
     if (atomic_flag_test_and_set(&context->e_stop_triggered)) {
-        LOG_ERR("Attempted to move motor after e-stop without homing!");
+        LOG_ERR("Attempted to move motor after e-stop or failed homing without homing!");
         return -EBUSY;
     }
     atomic_flag_clear(&context->e_stop_triggered);
@@ -1007,6 +1072,20 @@ int stepper_move_to_position(const struct device *dev, const float target_positi
         LOG_WRN("Target position is the same as current position.");
         return -EAGAIN;
     }
+
+    context->homing_verify = HOMING_VERIFY_NONE;
+    context->homing_error = 0;
+
+    return stepper_start_move(context, target_position, max_velocity, max_acceleration);
+}
+
+/**
+ * Start a move of `context`'s motor from `last_position_generated` to `target_position`. The caller has checked
+ * that the motor may move; the homing verification calls this while homing is still MOTION_IN_PROGESS.
+ */
+static int stepper_start_move(struct stepper_work_context *context, const float target_position,
+                              const float max_velocity, const float max_acceleration) {
+    const struct device *dev = context->dev;
 
     if (target_position < context->context.last_position_generated) {
         context->motor_direction = context->flip_limit_orientation ? LL_STEPPER_DIR_FORWARD : LL_STEPPER_DIR_BACKWARD;
@@ -1107,18 +1186,29 @@ int stepper_home(const struct device *dev) {
         return -ENOTSUP;
     }
 
-    if (ll_stepper_get_limit_switch_state(dev) == 1) {
-        LOG_INF("Already touching limit switch");
-        stepper_set_position_to_zero(dev);
-        return 0;
-    }
-
     if (work_context->motion_mode == MOTION_IN_PROGESS) {
         LOG_ERR("Attempted to move motor while already in motion.");
         return -EBUSY;
     }
 
     atomic_flag_clear(&work_context->e_stop_triggered);
+    work_context->homing_error = 0;
+    work_context->homing_verify = HOMING_VERIFY_NONE;
+
+    if (ll_stepper_get_limit_switch_state(dev) == 1) {
+        // Could be a switch stuck active, so this is only home once the verification has seen it release.
+        LOG_INF("Already touching limit switch; verifying it");
+        // The verification moves set their own deadlines; there's nothing to time until the first starts.
+        work_context->move_deadline_ms = 0;
+        work_context->drv_status_read_failures = 0;
+        work_context->homing_travel_exhausted = false;
+        work_context->move_control = MOVING_HOME;
+        work_context->homing_verify = HOMING_VERIFY_START;
+        work_context->motion_mode = MOTION_IN_PROGESS;
+        stepper_homing_at_switch(work_context);
+        stepper_monitor_start(work_context);
+        return 0;
+    }
 
     context->min_step = 1.0f / work_context->microsteps;
 
@@ -1180,6 +1270,65 @@ int stepper_home(const struct device *dev) {
     return 0;
 }
 
+/**
+ * Take the homing verification's next step, once the motor has stopped at the switch or a verification move has
+ * ended. The moves are normal moves at the motor's maximum velocity and acceleration.
+ */
+static void stepper_work_homing_verify_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct stepper_work_context *context = CONTAINER_OF(dwork, struct stepper_work_context, homing_verify_work);
+    const uint8_t motor_id = ll_motor_get_id(context->dev);
+
+    if (context->homing_verify == HOMING_VERIFY_NONE) {
+        return;
+    }
+
+    // A fault or a stop ended homing first; there's nothing left to verify.
+    if (context->motion_mode != MOTION_IN_PROGESS) {
+        stepper_homing_finish(context, 0);
+        return;
+    }
+
+    int ret;
+    switch (context->homing_verify) {
+        case HOMING_VERIFY_START:
+            context->homing_verify = HOMING_VERIFY_AWAY;
+            ret = stepper_start_move(context, STEPPER_HOMING_VERIFY_DISTANCE, context->motor_max_velocity,
+                                     context->motor_max_acceleration);
+            break;
+
+        case HOMING_VERIFY_AWAY:
+            // A defective switch still gets the move back, so the carriage ends where homing left it; the error
+            // is held until then.
+            if (ll_stepper_get_limit_switch_state(context->dev) != 0) {
+                LOG_ERR("Stepper %d limit switch still active %.1f from home; switch is defective", motor_id,
+                        (double)STEPPER_HOMING_VERIFY_DISTANCE);
+                context->homing_error = -ENXIO;
+            }
+
+            context->homing_verify = HOMING_VERIFY_RETURN;
+            ret = stepper_start_move(context, 0.0f, context->motor_max_velocity, context->motor_max_acceleration);
+            break;
+
+        case HOMING_VERIFY_RETURN:
+            if (context->homing_error == 0) {
+                LOG_INF("Stepper %d homed; limit switch verified", motor_id);
+            }
+            stepper_homing_finish(context, context->homing_error);
+            return;
+
+        default:
+            return;
+    }
+
+    if (ret < 0) {
+        LOG_ERR("Stepper %d homing verification move failed to start: %d", motor_id, ret);
+        context->motion_calculation_done = true;
+        ll_stepper_abort(context->dev);
+        stepper_homing_finish(context, ret);
+    }
+}
+
 int servo_read_config(const struct device *dev, servo_config_t *config) {
     const struct servo_work_context *context = find_servo_context_from_device(dev);
     if (context == NULL) {
@@ -1209,7 +1358,12 @@ void set_all_e_stop_flags(void) {
 movement_control_t stepper_homing_status(const struct device *dev) {
     const struct stepper_work_context *context = find_stepper_context_from_device(dev);
 
-    return !context ? MOVING_POSITION : context->move_control;
+    if (!context) {
+        return MOVING_POSITION;
+    }
+
+    // The verification's moves are part of homing.
+    return context->homing_verify != HOMING_VERIFY_NONE ? MOVING_HOME : context->move_control;
 }
 
 int stepper_read_config(const struct device *dev, struct stepper_config *config) {

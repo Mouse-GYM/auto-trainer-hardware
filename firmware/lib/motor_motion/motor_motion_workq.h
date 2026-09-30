@@ -29,6 +29,9 @@ typedef enum { MOTION_IDLE, MOTION_IN_PROGESS, MOTION_DONE, MOTION_FAULT } motio
 #define STEPPER_FAULT_MOVE_TIMEOUT BIT(2)
 #define STEPPER_FAULT_DRIVER_COMM BIT(3)  // DRV_STATUS couldn't be read during a move.
 
+// How far homing moves away from the limit switch to verify it, in move position units (mm on the pellet module).
+#define STEPPER_HOMING_VERIFY_DISTANCE 1.0f
+
 struct servo_work_context {
     const struct device *dev;  // Motor device to use
 
@@ -63,6 +66,15 @@ struct servo_work_context {
 
 typedef enum { MOVING_HOME, MOVING_POSITION } movement_control_t;
 
+// Once homing has found the limit switch, it proves the switch works: a normal move away from it, a check that it
+// released, and a normal move back to 0. Each value names the step `homing_verify_work` takes next.
+typedef enum {
+    HOMING_VERIFY_NONE,    // Not verifying.
+    HOMING_VERIFY_START,   // At the switch, zeroed; the move away is next.
+    HOMING_VERIFY_AWAY,    // Moving away; the switch must be released when it ends.
+    HOMING_VERIFY_RETURN,  // Moving back to 0; reaching the switch on the way re-zeroes there.
+} homing_verify_t;
+
 struct stepper_work_context {
     const struct device *dev;  // Motor device to use
 
@@ -84,8 +96,13 @@ struct stepper_work_context {
     // Set from the DMA callback when homing played out all its pulses without reaching the limit switch; the
     // monitor turns it into a fault.
     bool homing_travel_exhausted;
+    _Atomic homing_verify_t homing_verify;
+    // The error homing ended with when it didn't get past the verification (MOTION_FAULT with no `fault` bit),
+    // 0 otherwise.
+    int homing_error;
     struct k_work_delayable calculation_work;
     struct k_work_delayable check_driver_work;
+    struct k_work_delayable homing_verify_work;
     ll_stepper_cb_t stepper_cb;
 
     // Protection. While `fault` has any STEPPER_FAULT_* bit set, moves and homing are refused. `driver_disabled`
@@ -181,6 +198,11 @@ int stepper_move_relative(const struct device *dev, float delta_position, float 
  * stops stepping once it has covered CONFIG_LIB_MOTOR_MOTION_STEPPER_HOMING_MAX_TRAVEL and faults with
  * STEPPER_FAULT_MOVE_TIMEOUT if the switch wasn't reached, or sooner if it outlasts a move's timeout for that
  * distance. Returns -EPERM if a protection fault is latched.
+ *
+ * At the switch (or if it's already active), the position becomes 0 and the switch is verified: a normal move of
+ * STEPPER_HOMING_VERIFY_DISTANCE away from it, which must release it, then a normal move back to 0, re-zeroing
+ * wherever the switch closes again. A switch that stays active still gets the move back, then ends homing in
+ * MOTION_FAULT with `homing_error` -ENXIO, and moves are refused with -EBUSY until homing succeeds.
  */
 int stepper_home(const struct device *dev);
 
@@ -212,6 +234,12 @@ bool stepper_driver_output_disabled(const struct device *dev);
  *         otherwise -EIO.
  */
 int stepper_fault_error(uint32_t fault);
+
+/**
+ * @return the error to acknowledge a stepper move or homing that ended in MOTION_FAULT: the homing verification's
+ *         error if that is what failed, otherwise `stepper_fault_error` of the latched fault.
+ */
+int stepper_motion_error(const struct device *dev);
 
 /*
  * Cancel all work on the motor.
