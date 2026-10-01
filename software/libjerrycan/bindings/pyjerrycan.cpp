@@ -127,6 +127,7 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .def_readwrite("bootloader_command", &jerrycan_msg_t::bootloader_command)
         .def_readwrite("bootloader_response", &jerrycan_msg_t::bootloader_response)
         .def_readwrite("bootloader_data", &jerrycan_msg_t::bootloader_data)
+        .def_readwrite("uptime", &jerrycan_msg_t::uptime)
         .def_readwrite("delay", &jerrycan_msg_t::delay)
         .def_readwrite("fixed_xyz", &jerrycan_msg_t::fixed_xyz)
         .def_readwrite("ack", &jerrycan_msg_t::ack)
@@ -371,6 +372,19 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .def_readwrite("status", &jerrycan_cmd_bootloader_response_t::status)
     ;
 
+    py::class_<jerrycan_cmd_bootloader_status_t>(m, "BootloaderStatus")
+        .def(py::init<>())
+        .def_property("active",
+            [](const jerrycan_cmd_bootloader_status_t &a) { return a.active; },
+            [](jerrycan_cmd_bootloader_status_t &a, const uint8_t v) { a.active = v; })
+        .def_readwrite("bytes_written", &jerrycan_cmd_bootloader_status_t::bytes_written)
+    ;
+
+    py::class_<jerrycan_cmd_uptime_t>(m, "BootloaderUptime")
+        .def(py::init<>())
+        .def_readwrite("msecs", &jerrycan_cmd_uptime_t::msecs)
+    ;
+
     py::class_<jerrycan_cmd_bootloader_version_t>(m, "BootloaderVersion")
         .def(py::init<>())
         .def_property("running_version_major",
@@ -445,6 +459,7 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .value("BOOTLOADER_COMMAND", JERRYCAN_CMD_BOOTLOADER_COMMAND)
         .value("BOOTLOADER_RESPONSE", JERRYCAN_CMD_BOOTLOADER_RESPONSE)
         .value("BOOTLOADER_DATA", JERRYCAN_CMD_BOOTLOADER_DATA)
+        .value("UPTIME", JERRYCAN_CMD_UPTIME)
         .value("DELAY", JERRYCAN_CMD_DELAY)
         .value("FIXED_XYZ", JERRYCAN_CMD_FIXED_XYZ)
         .value("ACKNOWLEDGE", JERRYCAN_RSP_ACK)
