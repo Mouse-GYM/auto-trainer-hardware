@@ -26,6 +26,17 @@ menuconfig LIB_MOTOR_MOTION_SHELL
     help
       Enable the shell for the motor motion math library
 
+config LIB_MOTOR_MOTION_DEFER_STEPPER_FIXED_POSITION
+    bool "Ignore the stored stepper fixed position at boot"
+    default y
+    depends on LIB_MOTOR_MOTION && DT_HAS_LL_STEPPER_ENABLED
+    help
+      Load the persisted fixed X/Y/Z position but do not apply it, so each stepper reports and moves to 0
+      until the host sets a fixed position. The host application was written against the pellet module
+      losing this value across a reboot, which it did until the storage partition overlap of issue #7 was
+      fixed. The record is still read and still written, so setting this to n gives the restored-position
+      behaviour with no other change.
+
 config LIB_MOTOR_MOTION_WORK_QUEUE_PRIORITY
   int "Thread priority for the motor motion work queue"
   default 0
