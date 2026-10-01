@@ -22,6 +22,7 @@ LOG_MODULE_REGISTER(motor_settings);
 #define MIN_ANGLE_KEY "o_min"
 #define MAX_ANGLE_KEY "o_max"
 #define ANGLE_ADJUSTMENT_KEY "o_adj"
+#define POSITION_KEY "o_pos"
 #define SERVO_MIN_ANGLE_PWM_KEY "pwm_min"
 #define SERVO_MAX_ANGLE_PWM_KEY "pwm_max"
 
@@ -82,6 +83,25 @@ static __used float read_float(const char *name, const settings_read_cb read_cb,
     }
 
     return validate && (value <= 0.0f) ? dflt : value;
+}
+
+/*
+ * For quantities where zero and negative values are legitimate, so `read_float`'s `validate` guard cannot be
+ * used. Rejects a short record and a non-finite value as well, both of which `read_float` lets through.
+ */
+static __used float read_signed_float(const char *name, const settings_read_cb read_cb, void *cb_arg,
+                                      const float dflt) {
+    float value;
+
+    const ssize_t ret = read_cb(cb_arg, &value, sizeof(value));
+
+    if (ret != (ssize_t)sizeof(value) || !isfinite(value)) {
+        LOG_WRN("Failed to read %s from settings: %d", name, (int)ret);
+        return dflt;
+    }
+
+    LOG_DBG("restored %s: %f", name, (double)value);
+    return value;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -181,6 +201,10 @@ static int servo_settings_set(const char *key, size_t len, settings_read_cb read
         context->context.min_angle_pwm = read_float("min_angle_pwm", read_cb, cb_arg, true, 1000);
     } else if (strncmp(key, SERVO_MAX_ANGLE_PWM_KEY, sizeof(SERVO_MAX_ANGLE_PWM_KEY) - 1) == 0) {
         context->context.max_angle_pwm = read_float("max_angle_pwm", read_cb, cb_arg, true, 2000);
+    } else if (strncmp(key, POSITION_KEY, sizeof(POSITION_KEY) - 1) == 0) {
+        // Staged, not applied: the angle limits this is validated against may load after it does, so the
+        // decision belongs in the commit hook. NAN means there is nothing usable to apply.
+        context->pending_position = read_signed_float("position", read_cb, cb_arg, NAN);
     } else {
         LOG_WRN("Unknown key: %s", key);
         return -EINVAL;
@@ -241,7 +265,41 @@ int servo_settings_export(const struct device *dev, const size_t dt_id,
         rc = write_float(key, numeric, context->context.max_angle_pwm, id_index, storage_func);
     }
 
+    if (rc == 0 && isfinite(context->persisted_position)) {
+        static char key[] = GENERATE_SERVO_TEMPLATE(POSITION_KEY);
+        rc = write_float(key, numeric, context->persisted_position, id_index, storage_func);
+    }
+
     return rc;
+}
+
+static int servo_settings_commit(struct servo_work_context *const context) {
+    if (context == NULL) {
+        return 0;
+    }
+
+    const float candidate = context->pending_position;
+    context->pending_position = NAN;
+
+    // Judgeable against the configured travel, and inside it. An unusable pair of limits is not a licence to
+    // believe the record: with `max_angle` at +Inf every finite candidate would pass a bare range test.
+    const bool acceptable = isfinite(candidate) && servo_angle_limits_usable(context) &&
+                            candidate >= context->context.min_angle && candidate <= context->context.max_angle;
+
+    if (acceptable) {
+        context->context.known_position = candidate;
+        context->context.last_position_generated = candidate;
+        context->persisted_position = candidate;
+        context->position_assumed = false;
+    } else {
+        if (isfinite(candidate)) {
+            LOG_WRN("Stored servo position %f rejected against limits [%f, %f]; assuming the minimum",
+                    (double)candidate, (double)context->context.min_angle, (double)context->context.max_angle);
+        }
+        servo_assume_min_angle_position(context);
+    }
+
+    return 0;
 }
 
 #define DEFINE_SERVO_DEVICE_SETTINGS_FUNCTION(id)                                                            \
@@ -257,12 +315,19 @@ int servo_settings_export(const struct device *dev, const size_t dt_id,
         return servo_settings_export(dev, id, storage_func);                                                         \
     }
 
+#define DEFINE_SERVO_DEVICE_SETTINGS_COMMIT_FUNCTION(id)                   \
+    static int servo_settings_commit##id(void) {                           \
+        const struct device *dev = DEVICE_DT_GET(DT_INST(id, ll_servo));   \
+        return servo_settings_commit(find_servo_context_from_device(dev)); \
+    }
+
 #define DEFINE_SERVO_DEVICE_SETTINGS_HANDLERS(id)                                                                \
     SETTINGS_STATIC_HANDLER_DEFINE(servo##id, SETTINGS_MODULE_NAME "/" SETTINGS_SERVO_MODULE_NAME "/" #id, NULL, \
-                                   servo_settings_set##id, NULL, servo_settings_export##id);
+                                   servo_settings_set##id, servo_settings_commit##id, servo_settings_export##id);
 
 DT_FOREACH_OKAY_INST_ll_servo(DEFINE_SERVO_DEVICE_SETTINGS_FUNCTION);
 DT_FOREACH_OKAY_INST_ll_servo(DEFINE_SERVO_DEVICE_SETTINGS_EXPORT_FUNCTION);
+DT_FOREACH_OKAY_INST_ll_servo(DEFINE_SERVO_DEVICE_SETTINGS_COMMIT_FUNCTION);
 
 DT_FOREACH_OKAY_INST_ll_servo(DEFINE_SERVO_DEVICE_SETTINGS_HANDLERS);
 #endif
