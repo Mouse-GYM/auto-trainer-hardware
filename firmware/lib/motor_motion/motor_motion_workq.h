@@ -31,6 +31,17 @@ struct servo_work_context {
     atomic_flag e_stop_triggered;
     motion_mode_t motion_mode;
     bool motion_calculation_done;
+
+    // While `position_assumed` is set, `known_position` and `last_position_generated` hold `min_angle` and
+    // follow it; an accepted stored position or a started move ends that permanently. `position_valid` means
+    // firmware drove the horn to `known_position` this power cycle — a restored value does not qualify.
+    // `pending_position` stages the stored record between load and commit, and `persisted_position` is the
+    // only value the settings export may write. Both are NAN when there is nothing there.
+    bool position_assumed;
+    bool position_valid;
+    float pending_position;
+    float persisted_position;
+
     struct k_work_delayable calculation_work;
     struct k_work_delayable submission_work;
     ll_servo_cb_t servo_cb;
@@ -156,6 +167,20 @@ void servo_cancel_all_work(const struct device *dev);
  */
 void stepper_set_position_to_zero(const struct device *dev);
 void servo_set_position_to_zero(const struct device *dev);
+
+/*
+ * Adopt `min_angle` as the believed position of a servo that has never had a real one. A no-op once a stored
+ * position has been accepted or a move has started, so changing the angle limits cannot move the believed
+ * position of a servo whose horn firmware has already driven.
+ */
+void servo_assume_min_angle_position(struct servo_work_context *context);
+
+/*
+ * Whether the servo's angle limits can be reasoned against at all: both finite and correctly ordered. Nothing
+ * validates them on either install path — the settings loader passes `+Inf` through and the CAN cfg setter
+ * checks nothing — so every reader that compares against or clamps to them has to ask first.
+ */
+bool servo_angle_limits_usable(const struct servo_work_context *context);
 
 /*
  * Find the work contexts, given the device.
