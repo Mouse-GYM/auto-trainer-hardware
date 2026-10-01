@@ -732,8 +732,10 @@ int stepper_save_fixed_location(struct stepper_work_context *context, const int 
     } else {
         float val = context->fixed_position + position;
         
-        context->fixed_position = (val <= 0.0f) ? 0.0f : (val > 15.0f ? val = 15.0f : val);        
+        context->fixed_position = (val <= 0.0f) ? 0.0f : (val > 15.0f ? val = 15.0f : val);
     }
+
+    context->persisted_fixed_position = context->fixed_position;
 
     motor_settings_save();
 
