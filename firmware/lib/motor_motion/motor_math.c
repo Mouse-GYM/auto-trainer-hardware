@@ -4,6 +4,7 @@
 #include <fenv.h>
 #include <float.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifdef BENCH_TEST
@@ -305,6 +306,16 @@ static uint32_t degrees_to_pwm_count(const servo_motor_context_t *context, const
     const float pwm = (scaled_position + context->min_angle_pwm) / context->pwm_timer_increment;
 
     return roundf(pwm);
+}
+
+float motor_motion_servo_pwm_count_to_degrees(const servo_motor_context_t *context, const uint32_t count) {
+    const float scale_factor = (context->max_angle_pwm - context->min_angle_pwm) / FULL_RANGE_IN_DEGREES;
+    if (scale_factor == 0.0f) {
+        return NAN;
+    }
+
+    const float scaled_position = (float)count * context->pwm_timer_increment - context->min_angle_pwm;
+    return scaled_position / scale_factor + context->min_angle + context->angle_adjustment;
 }
 
 ssize_t motor_motion_servo_generate_displacement_table(uint32_t *table, const size_t table_size,

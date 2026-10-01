@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#define ARRAY_LEN(array) (sizeof(array) / sizeof((array)[0]))
+
 int print_n_iterations = 0;
 
 static float pulse_width_to_degrees(const servo_motor_context_t *context, const uint32_t pulse_width) {
@@ -136,6 +138,7 @@ static struct argp_option options[] = {
     {0, 0, 0, 0, "Tests", 5},
     {"verify-max-velocity", 'V', 0, 0, "Verify max velocity", 5},
     {"verify-max-acceleration", 'A', 0, 0, "Verify max acceleration", 5},
+    {"self-test", 'T', 0, 0, "Run the deterministic checks and exit nonzero if any fails.", 5},
     {0},
     {0},
 };
@@ -158,6 +161,7 @@ struct arguments {
     float steps_per_revolution;
     int verify_max_velocity;
     int verify_max_acceleration;
+    int self_test;
 };
 
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
@@ -248,6 +252,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         case 'A':
             arguments->verify_max_acceleration = 1;
             break;
+        case 'T':
+            arguments->self_test = 1;
+            break;
         default:
             return ARGP_ERR_UNKNOWN;
     }
@@ -329,9 +336,10 @@ static int model_and_verify_stepper(const struct arguments *arguments) {
         fprintf(stderr, "start and end position are the same.\n");
     }
 
-    int ret = motor_motion_stepper_init_context_struct(arguments->start, arguments->end, arguments->max_velocity,
-                                                       arguments->max_acceleration, arguments->min_step,
-                                                       arguments->timer_increment, &stepper_context);
+    const uint16_t microsteps = arguments->min_step > 0.0f ? (uint16_t)lroundf(1.0f / arguments->min_step) : 1;
+    int ret = motor_motion_stepper_init_context_struct(
+        arguments->start, arguments->end, arguments->max_velocity, arguments->max_acceleration, microsteps,
+        arguments->timer_increment, arguments->steps_per_revolution, &stepper_context);
     if (ret < 0) {
         fprintf(stderr, "Failed to initialize stepper context: %d\n", ret);
         print_context_variables(&stepper_context.motion_profile);
@@ -363,11 +371,158 @@ static int model_and_verify_stepper(const struct arguments *arguments) {
     return 0;
 }
 
+static int self_test_failures = 0;
+
+#define CHECK(cond, ...)                                         \
+    do {                                                         \
+        if (!(cond)) {                                           \
+            fprintf(stderr, "FAIL %s:%d: ", __func__, __LINE__); \
+            fprintf(stderr, __VA_ARGS__);                        \
+            fputc('\n', stderr);                                 \
+            self_test_failures++;                                \
+        }                                                        \
+    } while (0)
+
+// The stepper step timer runs at 2 MHz on both boards (st,prescaler = 84).
+#define STEPPER_TIMER_INCREMENT (1.0f / 2e6f)
+
+/*
+ * Set up the homing ramp as `stepper_home` does, then drain it as `stepper_generate_homing_block` does, until a
+ * short table: it must end exactly at the end of the profile's acceleration region, at the homing velocity.
+ */
+static void test_homing_ramp(const float velocity, const float acceleration, const uint16_t microsteps,
+                             const float steps_per_revolution) {
+    stepper_motor_context_t context = {0};
+    const float start = 3.0f;
+    const int ret = motor_motion_stepper_init_context_struct(start, start - 4.0f * velocity * velocity / acceleration,
+                                                             velocity, acceleration, microsteps,
+                                                             STEPPER_TIMER_INCREMENT, steps_per_revolution, &context);
+    CHECK(ret == 0, "init returned %d", ret);
+    if (ret != 0) {
+        return;
+    }
+    CHECK(fabsf(context.motion_profile.v_w - velocity) <= 1e-4f * velocity, "ramp tops out at %f, not %f",
+          (double)context.motion_profile.v_w, (double)velocity);
+
+    static uint32_t table[256];
+    size_t pulses = 0;
+    uint32_t last_interval = 0;
+    int calls = 0;
+    for (;;) {
+        const ssize_t n = motor_motion_stepper_generate_ramp_table(table, ARRAY_LEN(table), &context);
+        CHECK(n >= 0, "ramp table returned %ld", (long)n);
+        if (n > 0) {
+            pulses += (size_t)n;
+            last_interval = table[n - 1];
+        }
+        if (n < (ssize_t)ARRAY_LEN(table)) {
+            break;
+        }
+        if (++calls > 10000) {
+            CHECK(false, "ramp never ended");
+            return;
+        }
+    }
+    CHECK(motor_motion_stepper_generate_ramp_table(table, ARRAY_LEN(table), &context) == 0,
+          "a finished ramp generated more pulses");
+
+    const float pulse_length = 1.0f / (steps_per_revolution * (float)microsteps);
+    const float ramp_end = start - context.motion_profile.y_a;
+    CHECK(fabsf(context.last_position_generated - ramp_end) <= pulse_length, "ramp ended at %f, not %f",
+          (double)context.last_position_generated, (double)ramp_end);
+    const float expected_pulses = context.motion_profile.y_a / pulse_length;
+    CHECK(fabsf((float)pulses - expected_pulses) <= 1.0f, "%zu pulses, expected %f", pulses, (double)expected_pulses);
+
+    // The velocity approaches the homing velocity with zero slope, so the last pulse is a little slower than it.
+    const float final_interval = pulse_length / velocity / STEPPER_TIMER_INCREMENT;
+    CHECK(fabsf((float)last_interval - final_interval) <= 0.05f * final_interval + 1.0f,
+          "last interval %u counts, expected about %f", last_interval, (double)final_interval);
+}
+
+/*
+ * A move's final PWM count must map back to its target angle to within one count, and the inverse must refuse
+ * coinciding PWM endpoints.
+ */
+static void test_servo_pwm_round_trip(const float start, const float target, const float angle_adjustment) {
+    servo_motor_context_t context = {0};
+    const int ret = motor_motion_servo_init_context_struct(start, target, 200.0f, 100.0f, 1000.0f, 2000.0f, &context);
+    CHECK(ret == 0, "init returned %d", ret);
+    if (ret != 0) {
+        return;
+    }
+    context.pwm_timer_increment = 0.5f;
+    context.min_angle = 0.0f;
+    context.max_angle = 180.0f;
+    context.angle_adjustment = angle_adjustment;
+
+    // Drain it as the servo work handler does: a table shorter than the buffer is the last.
+    static uint32_t table[256];
+    uint32_t last_count = 0;
+    for (int calls = 0;; calls++) {
+        const ssize_t n = motor_motion_servo_generate_displacement_table(table, ARRAY_LEN(table), &context);
+        CHECK(n > 0, "displacement table returned %ld", (long)n);
+        if (n <= 0) {
+            return;
+        }
+        last_count = table[n - 1];
+        if (n < (ssize_t)ARRAY_LEN(table)) {
+            break;
+        }
+        if (calls > 10000) {
+            CHECK(false, "servo move never ended");
+            return;
+        }
+    }
+
+    // One count of the 2 MHz PWM timer, in degrees, over the library's 120 degree full range.
+    const float count_degrees = 0.5f * 120.0f / (2000.0f - 1000.0f);
+
+    // The forward mapping puts `min_angle + angle_adjustment` at `min_angle_pwm` and moves one count per
+    // `count_degrees`; the inverse must agree on both.
+    const uint32_t min_count = (uint32_t)lroundf(context.min_angle_pwm / context.pwm_timer_increment);
+    const float anchor = motor_motion_servo_pwm_count_to_degrees(&context, min_count);
+    CHECK(fabsf(anchor - (context.min_angle + angle_adjustment)) <= 1e-3f, "count %u maps to %f, not %f", min_count,
+          (double)anchor, (double)(context.min_angle + angle_adjustment));
+    const float slope = (motor_motion_servo_pwm_count_to_degrees(&context, min_count + 1000) - anchor) / 1000.0f;
+    CHECK(fabsf(slope - count_degrees) <= 1e-5f, "%f degrees per count, not %f", (double)slope, (double)count_degrees);
+
+    // The table holds back changes smaller than its 4-count dead band, so a move ends within that of its target.
+    const float angle = motor_motion_servo_pwm_count_to_degrees(&context, last_count);
+    CHECK(fabsf(angle - target) <= 4.0f * count_degrees, "count %u maps to %f, not %f (adjustment %f)", last_count,
+          (double)angle, (double)target, (double)angle_adjustment);
+
+    context.max_angle_pwm = context.min_angle_pwm;
+    CHECK(isnan(motor_motion_servo_pwm_count_to_degrees(&context, last_count)),
+          "coinciding PWM endpoints didn't give NAN");
+}
+
+static int self_test(void) {
+    test_homing_ramp(2.0f, 100.0f, 8, 48.0f);
+    test_homing_ramp(20.0f, 100.0f, 1, 48.0f);
+    test_homing_ramp(0.5f, 10.0f, 16, 200.0f);
+
+    test_servo_pwm_round_trip(0.0f, 90.0f, 0.0f);
+    test_servo_pwm_round_trip(90.0f, 12.5f, 0.0f);
+    test_servo_pwm_round_trip(10.0f, 117.0f, -5.0f);
+    test_servo_pwm_round_trip(60.0f, 3.0f, 4.0f);
+
+    if (self_test_failures != 0) {
+        fprintf(stderr, "%d check(s) failed\n", self_test_failures);
+        return 1;
+    }
+    fprintf(stderr, "All checks passed\n");
+    return 0;
+}
+
 int main(const int argc, char *argv[]) {
     static struct arguments arguments = {0};
     static struct argp argp = {options, parse_opt, args_doc, doc, NULL, NULL, NULL};
 
     argp_parse(&argp, argc, argv, 0, 0, &arguments);
+
+    if (arguments.self_test) {
+        return self_test();
+    }
 
     if (arguments.servo) {
         const int ret = model_and_verify_servo(&arguments);

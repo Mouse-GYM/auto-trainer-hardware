@@ -64,6 +64,8 @@ typedef enum __attribute__((packed)) {
     JERRYCAN_CMD_MAX = 0x3F,
 } jerrycan_cmd_type_t;
 
+// Broadcast with uuid 0 and not acknowledged. Once a module has applied it, the module sends a STATUS message whose
+// `estop_active` reports its e-stop latch; no other STATUS field is populated.
 typedef struct __attribute__((packed)) {
     uint8_t rsvd;  // Nonzero engages the e-stop, 0 releases it.
 } jerrycan_cmd_estop_t;
@@ -116,9 +118,10 @@ typedef struct __attribute__((packed)) {
 SIZE_CHECK(jerrycan_cmd_stepper_move_t, 13);
 
 // Home a stepper on its limit switch, then verify the switch with a normal move 1 unit (1 mm on the pellet module)
-// away from it, which must release it, and a normal move back to 0. Acked when that is done; the status reports
-// homing_status 0 throughout. -ENXIO, after the move back, if the switch stayed active (defective or stuck):
-// further moves are refused with -EBUSY until homing succeeds.
+// away from it, which must release it, and a normal move back, up to 0.5 units past home, which must see it close
+// again; home is where it does. Acked when that is done; the status reports homing_status 0 throughout. -ENXIO,
+// after the move back, if the switch stayed active (defective or stuck) or didn't close again: further moves are
+// refused with -EBUSY until homing succeeds.
 typedef struct __attribute__((packed)) {
     uint8_t motor_id : 7;
     uint8_t rsvd : 1;
@@ -129,7 +132,7 @@ SIZE_CHECK(jerrycan_cmd_stepper_home_t, 1);
 // Clear a stepper's latched protection fault (see jerrycan_stepper_status_flags_t) and re-enable its driver.
 // Acked with 0 when the driver is enabled again or nothing was latched; -EAGAIN while the driver still reports
 // otpw or ot; -EBUSY while the motor is moving; -EIO if the driver can't be reached. The aborted move stopped
-// short of the reported position, so home before relying on it.
+// short of the reported position, so moves are then refused with -EBUSY until homing succeeds.
 typedef struct __attribute__((packed)) {
     uint8_t motor_id;
 } jerrycan_cmd_stepper_fault_clear_t;
@@ -311,10 +314,12 @@ typedef struct __attribute__((packed)) {
 SIZE_CHECK(jerrycan_cmd_stepper_status_t, 12);
 
 // Bits of `jerrycan_cmd_stepper_status_t.status`; 0 means no fault.
-// 0x01-0x04 come from the stepper driver's configuration check at boot and are held until reset.
+// 0x01-0x04 come from the stepper driver's configuration check at boot and are held until reset; moves and homing
+// are refused with -EIO meanwhile. 0x04 is also set while the driver hasn't confirmed the stored microstep setting
+// at boot; a configuration write that sets microsteps successfully clears that.
 // 0x08-0x40 are protection faults latched during a move or homing. The move is aborted and acked with -EIO, or
 // -ETIMEDOUT for MOVE_TIMEOUT alone; further moves and homing are refused with -EPERM until
-// JERRYCAN_CMD_STEPPER_FAULT_CLEAR succeeds.
+// JERRYCAN_CMD_STEPPER_FAULT_CLEAR succeeds, and moves with -EBUSY after that until homing succeeds.
 // 0x80 reports that the protection switched the driver's power stage off; the motor freewheels.
 typedef enum __attribute__((packed)) {
     JERRYCAN_STEPPER_STATUS_DRIVER_UART_FAULT = 0x01,     // Driver didn't answer a verification read.

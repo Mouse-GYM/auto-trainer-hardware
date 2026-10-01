@@ -24,6 +24,9 @@ typedef struct {
     const struct i2c_dt_spec i2c;
     struct k_work read_i2c_work;
     struct k_work tare_i2c_work;
+    atomic_t tare_pending;  // Set from a tare request until its callback has the result.
+    ll_load_cell_tare_cb_t tare_cb;
+    void *tare_user_data;
     struct k_work drdy_failed_work;
     struct gpio_callback drdy_cb;
     struct k_timer *drdy_failed_timer;
@@ -101,14 +104,20 @@ static void ll_load_cell_tare_i2c_work_handler(struct k_work *work) {
     int ret = nau7802_set_calibration_mode(&data->i2c, OFFSET_CALIBRATION_SYSTEM);
     if (ret != 0) {
         LOG_ERR("Failed to initialize NUA7802: Error Setting NUA7802 calibration mode to system - %d", ret);
-        return;
+    } else {
+        /* Perform calibration */
+        ret = nau7802_calibrate(&data->i2c);
+        if (ret != 0) {
+            LOG_ERR("Failed to initialize NUA7802: Error performing NUA7802 system calibration - %d", ret);
+        }
     }
 
-    /* Perform calibration */
-    ret = nau7802_calibrate(&data->i2c);
-    if (ret != 0) {
-        LOG_ERR("Failed to initialize NUA7802: Error performing NUA7802 system calibration - %d", ret);
-        return;
+    // Release the request before reporting, so the callback may start another tare.
+    const ll_load_cell_tare_cb_t cb = data->tare_cb;
+    void *const user_data = data->tare_user_data;
+    atomic_clear(&data->tare_pending);
+    if (cb != NULL) {
+        cb(ret, user_data);
     }
 }
 
@@ -149,13 +158,24 @@ float ll_load_cell_get_load_mv_float(const struct device *dev) {
 }
 
 /* Tares the load cell */
-int ll_load_cell_tare(const struct device *dev) {
+int ll_load_cell_tare(const struct device *dev, const ll_load_cell_tare_cb_t cb, void *user_data) {
     ll_load_cell_data_t *data = dev->data;
+
+    // One request at a time: a second submit would join the queued calibration and lose this caller's result.
+    if (!atomic_cas(&data->tare_pending, 0, 1)) {
+        return -EBUSY;
+    }
+    data->tare_cb = cb;
+    data->tare_user_data = user_data;
 
     /* Submit I2C work item to the system workqueue */
     const int ret = k_work_error_handler(k_work_submit(&data->tare_i2c_work));
-    // k_work_submit returns 0, 1 or 2 when the work is (or already was) queued; only negatives are errors.
-    return ret < 0 ? ret : 0;
+    if (ret < 0) {
+        atomic_clear(&data->tare_pending);
+        return ret;
+    }
+
+    return 0;
 }
 
 /* Initialize NAU7802 24-bit ADC */

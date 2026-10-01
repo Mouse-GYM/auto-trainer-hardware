@@ -291,6 +291,14 @@ int ll_tone_generator_play_tone(const struct device *dev, unsigned int frequency
         return -1;
     }
 
+    /* Ensure that the specified frequency lies within the commandable range, before touching an active tone */
+    if (frequency_hz < TONE_GENERATOR_MIN_FREQUENCY || frequency_hz > TONE_GENERATOR_MAX_FREQUENCY) {
+        LOG_ERR("Invalid frequency <%d> - must reside within the commandable range [%d, %d]", frequency_hz,
+                TONE_GENERATOR_MIN_FREQUENCY, TONE_GENERATOR_MAX_FREQUENCY);
+        // Frequency 0 would divide by zero in the reload calculation below, which traps and halts the module.
+        return -EINVAL;
+    }
+
     /* If a tone is actively being played, stop it before continuing */
     if (data->enabled) {
         ret = ll_tone_generator_abort_tone(dev);
@@ -298,14 +306,6 @@ int ll_tone_generator_play_tone(const struct device *dev, unsigned int frequency
             LOG_ERR("Error playing tone: Failed to abort active tone - %d", ret);
             return ret;
         }
-    }
-
-    /* Ensure that the specified frequency lies within the commandable range */
-    if (frequency_hz < TONE_GENERATOR_MIN_FREQUENCY || frequency_hz > TONE_GENERATOR_MAX_FREQUENCY) {
-        LOG_ERR("Invalid frequency <%d> - must reside within the commandable range [%d, %d]", frequency_hz,
-                TONE_GENERATOR_MIN_FREQUENCY, TONE_GENERATOR_MAX_FREQUENCY);
-        // Frequency 0 would divide by zero in the reload calculation below, which traps and halts the module.
-        return -EINVAL;
     }
 
     /* Enable the audio amplifier */

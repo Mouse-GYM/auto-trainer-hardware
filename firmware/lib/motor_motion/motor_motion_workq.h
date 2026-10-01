@@ -32,6 +32,10 @@ typedef enum { MOTION_IDLE, MOTION_IN_PROGESS, MOTION_DONE, MOTION_FAULT } motio
 
 // How far homing moves away from the limit switch to verify it, in move position units (mm on the pellet module).
 #define STEPPER_HOMING_VERIFY_DISTANCE 1.0f
+// How far past 0 the move back may go looking for the switch to close again. Returning only to 0, the stop where
+// the switch first closed, would leave a working switch short of re-actuating whenever its repeatability spread
+// exceeds that one-pulse margin.
+#define STEPPER_HOMING_VERIFY_OVERTRAVEL 0.5f
 
 struct servo_work_context {
     const struct device *dev;  // Motor device to use
@@ -68,12 +72,14 @@ struct servo_work_context {
 typedef enum { MOVING_HOME, MOVING_POSITION } movement_control_t;
 
 // Once homing has found the limit switch, it proves the switch works: a normal move away from it, a check that it
-// released, and a normal move back to 0. Each value names the step `homing_verify_work` takes next.
+// released, and a normal move back past 0 that must see it close again. Each value names the step
+// `homing_verify_work` takes next.
 typedef enum {
     HOMING_VERIFY_NONE,    // Not verifying.
     HOMING_VERIFY_START,   // At the switch, zeroed; the move away is next.
     HOMING_VERIFY_AWAY,    // Moving away; the switch must be released when it ends.
-    HOMING_VERIFY_RETURN,  // Moving back to 0; reaching the switch on the way re-zeroes there.
+    HOMING_VERIFY_RETURN,  // Moving back; the move ending before the switch closes fails homing.
+    HOMING_VERIFY_CLOSED,  // The switch closed on the way back and was taken as 0; homing is verified.
 } homing_verify_t;
 
 struct stepper_work_context {
@@ -122,6 +128,9 @@ struct stepper_work_context {
     float motor_steps_per_revolution;
     float fixed_position;
     uint16_t microsteps;  // micro steps per step; should be a power of 2.
+    // The driver didn't confirm `microsteps` at boot, so planner and driver may disagree on the step size. Moves
+    // and homing are refused until a configuration write sets microsteps successfully.
+    bool microsteps_unverified;
     bool flip_limit_orientation;
 
     // Command-based information
@@ -188,10 +197,12 @@ int stepper_save_fixed_location(struct stepper_work_context *context, int motor_
  * The velocity is capped at what the step timer can produce at the current microstep setting.
  *
  * @retval -ENODEV if the device is not found in the list.
- * @retval -EBUSY if another motion profile is already running, or the motor must be homed after an e-stop or a
- *         failed homing.
+ * @retval -EBUSY if another motion profile is already running, or the motor must be homed after an e-stop, a
+ *         protection fault or a failed homing.
  * @retval -ECANCELED if the e-stop is engaged.
  * @retval -EPERM if a protection fault is latched; see `stepper_clear_fault`.
+ * @retval -EIO if the driver's boot-time configuration check failed (until reset), or the driver didn't confirm
+ *         the microstep setting at boot (until `stepper_set_parameters` sets microsteps successfully).
  * @retval -EAGAIN if the target is less than one step pulse away.
  */
 int stepper_move_to_position(const struct device *dev, float target_position, float max_velocity,
@@ -206,19 +217,22 @@ int stepper_move_relative(const struct device *dev, float delta_position, float 
  * Drive toward the limit switch, ramping up to the homing velocity. DRV_STATUS is polled as for a move. Homing
  * stops stepping once it has covered CONFIG_LIB_MOTOR_MOTION_STEPPER_HOMING_MAX_TRAVEL and faults with
  * STEPPER_FAULT_MOVE_TIMEOUT if the switch wasn't reached, or sooner if it outlasts a move's timeout for that
- * distance. Returns -EPERM if a protection fault is latched.
+ * distance. Returns -EPERM if a protection fault is latched, and -EIO as `stepper_move_to_position` does for an
+ * unverified driver configuration.
  *
  * At the switch (or if it's already active), the position becomes 0 and the switch is verified: a normal move of
- * STEPPER_HOMING_VERIFY_DISTANCE away from it, which must release it, then a normal move back to 0, re-zeroing
- * wherever the switch closes again. A switch that stays active still gets the move back, then ends homing in
- * MOTION_FAULT with `homing_error` -ENXIO, and moves are refused with -EBUSY until homing succeeds.
+ * STEPPER_HOMING_VERIFY_DISTANCE away from it, which must release it, then a normal move back toward it, up to
+ * STEPPER_HOMING_VERIFY_OVERTRAVEL past 0, which must see it close again and re-zeroes there. A switch that stays
+ * active is moved back only to 0; it, or one that doesn't close again, ends homing in MOTION_FAULT with
+ * `homing_error` -ENXIO, and moves are refused with -EBUSY until homing succeeds. A protection fault during homing
+ * leaves the same requirement once it is cleared.
  */
 int stepper_home(const struct device *dev);
 
 /**
  * Clear a latched protection fault and re-enable the driver. Blocks for the driver's UART exchanges (tens of
- * ms); don't call from an ISR. Clearing does nothing about the position: the aborted move stopped short of
- * `last_position_generated`, so the caller should home before relying on it.
+ * ms); don't call from an ISR. The aborted move stopped short of `last_position_generated`, so moves are still
+ * refused with -EBUSY until the motor is homed.
  *
  * @retval 0 if no fault is latched, or once the driver reads back as enabled and the fault is cleared.
  * @retval -ENODEV if the device is not found in the list.
@@ -237,6 +251,12 @@ uint32_t stepper_get_fault(const struct device *dev);
  * @return whether the protection has confirmed the driver's power stage is off. Safe to call from ISRs.
  */
 bool stepper_driver_output_disabled(const struct device *dev);
+
+/**
+ * @return whether the driver didn't confirm the microstep setting at boot, which refuses moves and homing until a
+ *         configuration write sets microsteps successfully. Safe to call from ISRs.
+ */
+bool stepper_microsteps_unverified(const struct device *dev);
 
 /**
  * @return the error to acknowledge a move aborted with `fault`: -ETIMEDOUT for a move timeout alone,
@@ -326,7 +346,8 @@ void stepper_e_stop(const struct device *dev);
 
 /**
  * E-stop one servo: stop the pulse-width updates and drop queued blocks, so the horn holds where it is. A move in
- * progress ends in MOTION_FAULT. Blocks until a running refill finishes; don't call from an ISR.
+ * progress ends in MOTION_FAULT, and the next move starts from the held position. Blocks until a running refill
+ * finishes; don't call from an ISR.
  */
 void servo_e_stop(const struct device *dev);
 

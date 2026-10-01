@@ -26,31 +26,49 @@ static uint8_t can_node_id;
 #define CAN_TX_MAILBOX_TIMEOUT K_MSEC(50)
 #define CAN_TX_DONE_TIMEOUT K_MSEC(50)
 
-static K_SEM_DEFINE(can_tx_done_sem, 0, 1);
+// The one frame handed to the driver and not yet completed. A frame that times out stays outstanding until the
+// driver completes it, so no second frame is accepted meanwhile: its callback can't be mistaken for another
+// frame's, and two frames can't sit in the TX buffers at once, where the controller sends them by CAN ID rather
+// than in order.
+static struct {
+    struct k_sem done;
+    atomic_t outstanding;
+    int status;
+} can_tx;
 
 static inline uint16_t can_id(jerrycan_cmd_type_t msg_type) { return (uint16_t)msg_type << 5 | can_node_id; }
 
 static void can_tx_done(const struct device *dev, int error, void *user_data) {
     ARG_UNUSED(dev);
-    ARG_UNUSED(error);
-    k_sem_give(user_data);
+    ARG_UNUSED(user_data);
+    can_tx.status = error;
+    atomic_clear(&can_tx.outstanding);
+    k_sem_give(&can_tx.done);
 }
 
 /**
  * Send `frame` and wait, within bounds, for it to complete, so frames still go out one at a time and in order.
  *
- * @return 0 once sent, -EAGAIN if the bus didn't take it in time, or the driver's error.
+ * @return 0 once sent; -EAGAIN if the bus didn't take it in time or still holds an earlier frame that timed out;
+ *         or the driver's error, including one it reports after accepting the frame (-ENETUNREACH for bus-off).
  */
 static int jerrycan_send_frame(const struct can_frame *frame) {
-    // A frame that timed out earlier may complete now; don't count that as this one.
-    k_sem_reset(&can_tx_done_sem);
+    if (!atomic_cas(&can_tx.outstanding, 0, 1)) {
+        return -EAGAIN;
+    }
+    k_sem_reset(&can_tx.done);
 
-    const int ret = can_send(can_dev, frame, CAN_TX_MAILBOX_TIMEOUT, can_tx_done, &can_tx_done_sem);
+    const int ret = can_send(can_dev, frame, CAN_TX_MAILBOX_TIMEOUT, can_tx_done, NULL);
     if (ret != 0) {
+        atomic_clear(&can_tx.outstanding);
         return ret;
     }
 
-    return k_sem_take(&can_tx_done_sem, CAN_TX_DONE_TIMEOUT) == 0 ? 0 : -EAGAIN;
+    if (k_sem_take(&can_tx.done, CAN_TX_DONE_TIMEOUT) != 0) {
+        return -EAGAIN;
+    }
+
+    return can_tx.status;
 }
 
 static int get_can_node_id(uint8_t *can_node_id_out) {
@@ -264,11 +282,27 @@ void jerrycan_register_rx_callback(jerrycan_rx_callback_t *callback) {
     sys_slist_append(&can_rx_callbacks_list, &callback->node);
 }
 
+static jerrycan_estop_handler_t estop_handler;
+
+void jerrycan_set_estop_handler(const jerrycan_estop_handler_t handler) { estop_handler = handler; }
+
+static void can_estop_rx(const struct device *dev, struct can_frame *frame, void *user_data) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+
+    const jerrycan_estop_handler_t handler = estop_handler;
+    if (handler != NULL && can_dlc_to_bytes(frame->dlc) >= sizeof(jerrycan_cmd_estop_t)) {
+        handler(((const jerrycan_cmd_estop_t *)frame->data)->rsvd != 0);
+    }
+}
+
 static int jerrycan_init() {
     int ret;
 
     // Initialize the linked list that will hold the callbacks to be called on RX frame
     sys_slist_init(&can_rx_callbacks_list);
+
+    k_sem_init(&can_tx.done, 0, 1);
 
     // Read this device type and address from GPIOS. Without them the address would be arbitrary, so don't join
     // the bus at all.
@@ -308,6 +342,23 @@ static int jerrycan_init() {
     if (ret) {
         LOG_ERR("Failed to start CAN device: %d", ret);
         return ret;
+    }
+
+    // The controller hands each frame to the first filter element that matches it, and Zephyr fills elements in the
+    // order they're added. The node and broadcast filters below also match ESTOP frames, so these go first.
+    const uint8_t estop_destinations[] = {can_node_id, NODE_ID_MASK};
+    for (size_t i = 0; i < ARRAY_SIZE(estop_destinations); i++) {
+        const struct can_filter jerrycan_estop_filter = {
+            .flags = 0,
+            .id = (uint16_t)JERRYCAN_CMD_ESTOP << 5 | estop_destinations[i],
+            .mask = CAN_STD_ID_MASK,
+        };
+
+        ret = can_add_rx_filter(can_dev, can_estop_rx, NULL, &jerrycan_estop_filter);
+        if (ret < 0) {
+            LOG_ERR("Failed to add CAN e-stop filter: %d", ret);
+            return ret;
+        }
     }
 
     // Add the filter for messages address to this specific device

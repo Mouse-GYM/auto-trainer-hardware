@@ -61,6 +61,8 @@ void trigger_e_stop(void) {
     set_all_e_stop_flags();
 }
 
+void latch_e_stop(void) { atomic_set(&e_stop_engaged_flag, 1); }
+
 void release_e_stop(void) { atomic_set(&e_stop_engaged_flag, 0); }
 
 bool e_stop_engaged(void) { return atomic_get(&e_stop_engaged_flag) != 0; }

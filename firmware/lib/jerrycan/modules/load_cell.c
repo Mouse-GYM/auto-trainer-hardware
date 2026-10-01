@@ -76,6 +76,18 @@ static void jerrycan_load_cell_tx() {
     }
 }
 
+// `user_data` carries the tare command's uuid.
+static void jerrycan_load_cell_tare_done(const int result, void *user_data) {
+    const uint8_t uuid = (uint8_t)(uintptr_t)user_data;
+
+    if (result < 0) {
+        LOG_ERR("Load cell tare (uuid %u) failed: %d", uuid, result);
+    } else {
+        LOG_INF("Load cell tare (uuid %u) done", uuid);
+    }
+    jerrycan_send_ack(uuid, result);
+}
+
 static int jerrycan_load_cell_tare_handler(const jerrycan_msg_t *msg) {
     int rc = -ENOENT;
 
@@ -85,12 +97,12 @@ static int jerrycan_load_cell_tare_handler(const jerrycan_msg_t *msg) {
         uint16_t instance_number = context->instance_number;
 
         if (msg->load_cell_tare.instance == instance_number) {
-            rc = ll_load_cell_tare(load_cell);
-
+            // Acknowledged when the calibration finishes; a tare already pending keeps its own uuid (-EBUSY here).
+            rc = ll_load_cell_tare(load_cell, jerrycan_load_cell_tare_done, (void *)(uintptr_t)msg->uuid);
             if (rc < 0) {
                 LOG_ERR("Failed to perform the requested load cell tare operation: %d", rc);
             } else {
-                LOG_INF("Successfully tared load_cell%d", instance_number);
+                rc = COMMAND_NOT_COMPLETE;
             }
             break;
         }

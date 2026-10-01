@@ -384,7 +384,12 @@ static void stepper_motor_event_callback(const struct device *const dev, ll_moto
             if (context && context->motion_mode == MOTION_IN_PROGESS) {
                 if (context->homing_verify == HOMING_VERIFY_RETURN) {
                     // Back onto the switch: where it closes is home, as when homing first found it.
+                    context->homing_verify = HOMING_VERIFY_CLOSED;
                     stepper_homing_at_switch(context);
+                    break;
+                }
+                if (context->homing_verify == HOMING_VERIFY_CLOSED) {
+                    // Contact bounce; home was taken at the first edge.
                     break;
                 }
 
@@ -631,6 +636,26 @@ static const struct device *stepper_driver_of(const struct stepper_work_context 
 }
 
 /**
+ * Whether the driver's configuration is confirmed well enough to move: its boot-time check passed, and it took
+ * `microsteps`. A failed boot check holds until reset. Replaying the driver's init at runtime would not be a safe
+ * way to clear it: init sets MRES to 1 ahead of the motion layer's microstep write, and writes CHOPCONF with a
+ * nonzero toff, which would re-enable a driver the protection has switched off.
+ */
+static bool stepper_driver_config_verified(const struct stepper_work_context *context) {
+    const struct device *driver = stepper_driver_of(context);
+    if (driver == NULL) {
+        return true;
+    }
+
+    return adi_tmc2209_get_init_check(driver)->faults == 0 && !context->microsteps_unverified;
+}
+
+bool stepper_microsteps_unverified(const struct device *dev) {
+    const struct stepper_work_context *context = find_stepper_context_from_device(dev);
+    return context != NULL && context->microsteps_unverified;
+}
+
+/**
  * Timeout for a move of `distance` revolutions. The nominal duration d/v + 2v/a is the profile's total time t_t
  * when it reaches `velocity`, and bounds t_t = 2 * sqrt(2d/a) from above when it doesn't, so the timeout grows in
  * proportion to the distance.
@@ -685,19 +710,34 @@ static uint32_t stepper_poll_driver(struct stepper_work_context *context) {
 /**
  * Latch `fault`, stop stepping, disable the driver, and hand the move to the CAN layer as MOTION_FAULT so it is
  * acked with an error. What happens next is the host's call; see `stepper_clear_fault`.
+ *
+ * STEPPER_FAULT_MOVE_TIMEOUT is dropped unless the move whose `move_deadline_ms` was `deadline` is still running: a
+ * move that ended, or gave way to another, meanwhile didn't time out. Thermal and communication faults stand.
  */
-static void stepper_trip_fault(struct stepper_work_context *context, const uint32_t fault) {
+static void stepper_trip_fault(struct stepper_work_context *context, uint32_t fault, const int64_t deadline) {
     const uint8_t motor_id = ll_motor_get_id(context->dev);
 
     k_mutex_lock(&stepper_fault_lock, K_FOREVER);
-    atomic_or(&context->fault, (atomic_val_t)fault);
 
     // Claim the move before stopping it, so a DMA or limit-switch event can't report it as done.
     const unsigned int key = irq_lock();
+    if (context->motion_mode != MOTION_IN_PROGESS || context->move_deadline_ms != deadline) {
+        fault &= ~STEPPER_FAULT_MOVE_TIMEOUT;
+    }
+    if (fault == 0) {
+        irq_unlock(key);
+        k_mutex_unlock(&stepper_fault_lock);
+        return;
+    }
+    atomic_or(&context->fault, (atomic_val_t)fault);
+
     if (context->motion_mode == MOTION_IN_PROGESS) {
         context->motion_mode = MOTION_FAULT;
     }
     context->motion_calculation_done = true;
+    // The carriage stopped short of `last_position_generated` (and homing never tracked it at all), so moves need a
+    // successful home once the fault is cleared, as after an e-stop.
+    atomic_flag_test_and_set(&context->e_stop_triggered);
     irq_unlock(key);
 
     // No more refills, then halt the pulse train and drop the queued blocks.
@@ -728,8 +768,11 @@ static void stepper_work_check_driver_handler(struct k_work *work) {
         return;
     }
 
+    // The read blocks, and the move can end or another start meanwhile; `stepper_trip_fault` checks that this
+    // deadline still belongs to the running move.
+    const int64_t deadline = context->move_deadline_ms;
     uint32_t fault = stepper_poll_driver(context);
-    if (context->move_deadline_ms != 0 && k_uptime_get() > context->move_deadline_ms) {
+    if (deadline != 0 && k_uptime_get() > deadline) {
         fault |= STEPPER_FAULT_MOVE_TIMEOUT;
     }
     if (context->homing_travel_exhausted) {
@@ -740,7 +783,7 @@ static void stepper_work_check_driver_handler(struct k_work *work) {
     }
 
     if (fault != 0) {
-        stepper_trip_fault(context, fault);
+        stepper_trip_fault(context, fault, deadline);
         return;
     }
 
@@ -854,7 +897,12 @@ static int motor_workq_init_and_start(void) {
         const ll_motor_cfg_t *motor_data = motor_dev->config;
         const struct device *stepper_driver_dev = motor_data->stepper_driver_device;
         if (stepper_driver_dev != NULL) {
-            adi_tmc2209_set_microstep(stepper_driver_dev, context->microsteps);
+            const int ret = adi_tmc2209_set_microstep(stepper_driver_dev, context->microsteps);
+            if (ret < 0) {
+                LOG_ERR("Stepper %u driver didn't take microsteps %u (%d); moves refused until reconfigured",
+                        (unsigned int)i, context->microsteps, ret);
+                context->microsteps_unverified = true;
+            }
         }
     }
 
@@ -1030,10 +1078,10 @@ int stepper_set_parameters(const struct device *dev, const float max_velocity, c
         return -EBUSY;
     }
 
-    // Validate everything before changing anything. A value <= 0 (or NaN) means "unchanged"; +Inf is rejected.
-    if ((max_velocity > 0.0f && !isfinite(max_velocity)) || (max_acceleration > 0.0f && !isfinite(max_acceleration)) ||
-        (homing_velocity > 0.0f && !isfinite(homing_velocity)) ||
-        (steps_per_revolution > 0.0f && !isfinite(steps_per_revolution))) {
+    // Validate everything before changing anything. A finite value <= 0 means "unchanged"; NaN and both
+    // infinities are rejected, since comparisons would otherwise treat NaN and -Inf as "unchanged" too.
+    if (!isfinite(max_velocity) || !isfinite(max_acceleration) || !isfinite(homing_velocity) ||
+        !isfinite(steps_per_revolution)) {
         LOG_ERR("Refusing non-finite stepper configuration");
         return -EINVAL;
     }
@@ -1055,6 +1103,7 @@ int stepper_set_parameters(const struct device *dev, const float max_velocity, c
             }
         }
         context->microsteps = microsteps;
+        context->microsteps_unverified = false;
     }
 
     if (max_velocity > 0.0f) {
@@ -1128,8 +1177,13 @@ int stepper_move_to_position(const struct device *dev, const float target_positi
         return -EPERM;
     }
 
+    if (!stepper_driver_config_verified(context)) {
+        LOG_ERR("Attempted to move with the driver configuration unverified");
+        return -EIO;
+    }
+
     if (atomic_flag_test_and_set(&context->e_stop_triggered)) {
-        LOG_ERR("Attempted to move motor after e-stop or failed homing without homing!");
+        LOG_ERR("Attempted to move motor after e-stop, protection fault or failed homing without homing!");
         return -EBUSY;
     }
     atomic_flag_clear(&context->e_stop_triggered);
@@ -1270,6 +1324,11 @@ int stepper_home(const struct device *dev) {
         return -EPERM;
     }
 
+    if (!stepper_driver_config_verified(work_context)) {
+        LOG_ERR("Attempted to home with the driver configuration unverified");
+        return -EIO;
+    }
+
     if (cfg->limit_switch_pin.port == NULL) {
         LOG_ERR("Limit switch pin not set");
         return -ENOTSUP;
@@ -1395,11 +1454,24 @@ static void stepper_work_homing_verify_handler(struct k_work *work) {
                 context->homing_error = -ENXIO;
             }
 
+            // A working switch closes on the way back, which stops the move and re-zeroes there. A defective one is
+            // only taken back to 0, where homing left the carriage, rather than past it into the switch.
             context->homing_verify = HOMING_VERIFY_RETURN;
-            ret = stepper_start_move(context, 0.0f, context->motor_max_velocity, context->motor_max_acceleration);
+            ret = stepper_start_move(context, context->homing_error == 0 ? -STEPPER_HOMING_VERIFY_OVERTRAVEL : 0.0f,
+                                     context->motor_max_velocity, context->motor_max_acceleration);
             break;
 
         case HOMING_VERIFY_RETURN:
+            // The move back ended without the switch closing.
+            if (context->homing_error == 0) {
+                LOG_ERR("Stepper %d limit switch didn't close again within %.1f past home", motor_id,
+                        (double)STEPPER_HOMING_VERIFY_OVERTRAVEL);
+                context->homing_error = -ENXIO;
+            }
+            stepper_homing_finish(context, context->homing_error);
+            return;
+
+        case HOMING_VERIFY_CLOSED:
             if (context->homing_error == 0) {
                 LOG_INF("Stepper %d homed; limit switch verified", motor_id);
             }
@@ -1481,7 +1553,8 @@ void servo_e_stop(const struct device *dev) {
 
     const unsigned int key = irq_lock();
     context->motion_calculation_done = true;
-    if (context->motion_mode == MOTION_IN_PROGESS) {
+    const bool was_moving = context->motion_mode == MOTION_IN_PROGESS;
+    if (was_moving) {
         context->motion_mode = MOTION_FAULT;
     }
     irq_unlock(key);
@@ -1493,8 +1566,18 @@ void servo_e_stop(const struct device *dev) {
     // A refill that was already running may have queued a block and restarted the DMA.
     ll_servo_abort(dev);
 
-    // The horn stopped somewhere inside the block that was playing, not at `known_position`.
+    // The horn stopped somewhere inside the block that was playing, not at `known_position`, and
+    // `last_position_generated` runs up to two blocks ahead of it. Plan the next move from the pulse width it holds,
+    // or it would start by jumping to the generated position.
     context->position_valid = false;
+    uint32_t count;
+    if (was_moving && ll_servo_get_pulse_count(dev, &count) == 0) {
+        const float position = motor_motion_servo_pwm_count_to_degrees(&context->context, count);
+        if (isfinite(position)) {
+            context->context.known_position = position;
+            context->context.last_position_generated = position;
+        }
+    }
 }
 
 movement_control_t stepper_homing_status(const struct device *dev) {

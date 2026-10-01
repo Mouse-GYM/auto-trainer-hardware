@@ -125,6 +125,14 @@ ssize_t motor_motion_servo_generate_displacement_table(uint32_t *table, size_t t
                                                        servo_motor_context_t *context);
 
 /**
+ * The angle (degrees) a PWM pulse of `count` timer counts drives the servo to: the inverse of the mapping the
+ * displacement table uses.
+ *
+ * @return the angle, or NAN if the PWM endpoints of `context` coincide.
+ */
+float motor_motion_servo_pwm_count_to_degrees(const servo_motor_context_t *context, uint32_t count);
+
+/**
  * Generates a table of values with a pulse at the correct time for each stamp.
  *
  * @return the number of entries generated or -1 on error.

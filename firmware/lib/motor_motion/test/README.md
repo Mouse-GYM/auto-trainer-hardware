@@ -9,6 +9,14 @@ cmake ..
 make
 ```
 
+Self-test
+===
+```sh
+build/motor_motion_test --self-test
+```
+runs deterministic checks of the homing ramp (it ends at the end of the acceleration region, at the homing velocity)
+and of the servo PWM-to-angle inverse, and exits nonzero if any fails. `ctest` in the build directory runs the same.
+
 Use
 ===
 See

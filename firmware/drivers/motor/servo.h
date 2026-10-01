@@ -19,3 +19,10 @@ int ll_servo_dma_stop(const struct device *dev);
  * raised.
  */
 int ll_servo_abort(const struct device *dev);
+/*
+ * Read the pulse width the PWM holds, in timer counts: the last one the DMA wrote. After `ll_servo_abort` that is
+ * where the horn stays.
+ *
+ * @return 0 on success, -EINVAL if the channel isn't one with a compare register.
+ */
+int ll_servo_get_pulse_count(const struct device *dev, uint32_t *count);

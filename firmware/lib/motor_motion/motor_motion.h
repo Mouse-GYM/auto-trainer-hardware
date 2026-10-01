@@ -35,6 +35,12 @@ void motors_all_stop(void);
 void trigger_e_stop(void);
 
 /*
+ * Engage the e-stop latch alone: new moves and homing are refused from now on, but nothing that is running stops
+ * until `trigger_e_stop`. Safe to call from ISRs.
+ */
+void latch_e_stop(void);
+
+/*
  * Release the e-stop, so servos can move and steppers can home again.
  */
 void release_e_stop(void);

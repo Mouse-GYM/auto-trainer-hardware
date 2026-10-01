@@ -86,6 +86,35 @@ int ll_servo_abort(const struct device *dev) {
     return ret;
 }
 
+int ll_servo_get_pulse_count(const struct device *dev, uint32_t *count) {
+    const ll_motor_cfg_t *cfg = dev->config;
+
+    // With compare preload enabled this reads the preload register, which the DMA writes and which becomes the
+    // active pulse width at the next update; once the DMA has stopped, the two hold the same value.
+    switch (cfg->channel) {
+        case LL_TIM_CHANNEL_CH1:
+            *count = LL_TIM_OC_GetCompareCH1(cfg->timer);
+            return 0;
+        case LL_TIM_CHANNEL_CH2:
+            *count = LL_TIM_OC_GetCompareCH2(cfg->timer);
+            return 0;
+        case LL_TIM_CHANNEL_CH3:
+            *count = LL_TIM_OC_GetCompareCH3(cfg->timer);
+            return 0;
+        case LL_TIM_CHANNEL_CH4:
+            *count = LL_TIM_OC_GetCompareCH4(cfg->timer);
+            return 0;
+        case LL_TIM_CHANNEL_CH5:
+            *count = LL_TIM_OC_GetCompareCH5(cfg->timer);
+            return 0;
+        case LL_TIM_CHANNEL_CH6:
+            *count = LL_TIM_OC_GetCompareCH6(cfg->timer);
+            return 0;
+        default:
+            return -EINVAL;
+    }
+}
+
 #define SERVO_INST(idx)                                                                             \
     PINCTRL_DT_INST_DEFINE(idx);                                                                    \
                                                                                                     \

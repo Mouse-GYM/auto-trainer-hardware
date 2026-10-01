@@ -45,6 +45,31 @@ LOG_MODULE_DECLARE(jerrycan, CONFIG_LIB_JERRYCAN_LOG_LEVEL);
 
 #define CAN_TIMEOUT K_MSEC(100)
 
+// Per servo: a move was started and its completion is still to be acknowledged, with the context's `uuid`.
+// Commands and the status work both run in cooperative threads (main and the system workqueue), so they don't
+// preempt each other; this is only shared between them.
+static bool ack_pending[SERVO_COUNT];
+
+/**
+ * Acknowledge servo `motor_id`'s finished move, if it has one, and return it to MOTION_IDLE.
+ */
+static void servo_consume_completion(const int motor_id) {
+    struct servo_work_context *context = find_servo_context_from_device(servo_motor_by_id(motor_id));
+    if (context == NULL) {
+        return;
+    }
+
+    if (context->motion_mode == MOTION_DONE || context->motion_mode == MOTION_FAULT) {
+        // MOTION_FAULT: the e-stop stopped this move short of its target.
+        const int error = context->motion_mode == MOTION_DONE ? 0 : -ECANCELED;
+        context->motion_mode = MOTION_IDLE;
+        if (ack_pending[motor_id]) {
+            jerrycan_send_ack(context->uuid, error);
+            ack_pending[motor_id] = false;
+        }
+    }
+}
+
 static int servo_handler(const jerrycan_msg_t *msg) {
     int rc;
 
@@ -55,45 +80,50 @@ static int servo_handler(const jerrycan_msg_t *msg) {
         msg->servo_move.motor_id, msg->servo_move.abs_or_rel, (double)msg->servo_move.position,
         (double)msg->servo_move.max_velocity, (double)msg->servo_move.max_acceleration, (int)msg->uuid);
 
-    const struct device *dev = servo_motor_by_id(msg->servo_move.motor_id);
+    const uint8_t motor_id = msg->servo_move.motor_id;
+    const struct device *dev = servo_motor_by_id(motor_id);
     struct servo_work_context *context = find_servo_context_from_device(dev);
     if (!context) {
-        rc = -ENOENT;
-    } else {
-        // Claim the completion before starting, in case the move finishes first; give it back if the move doesn't
-        // start, so a move already running keeps its own uuid.
-        const uint8_t prev_uuid = context->uuid;
-        context->uuid = msg->uuid;
-
-        switch (msg->servo_move.abs_or_rel) {
-            case JERRYCAN_MOVE_ABSOLUTE:
-                // Move the servo to the absolute position
-                rc = servo_move_to_position(dev, msg->servo_move.position, msg->servo_move.max_velocity,
-                                            msg->servo_move.max_acceleration);
-                break;
-
-            case JERRYCAN_MOVE_RELATIVE:
-                // Move the servo to the relative position
-                rc = servo_move_relative(dev, msg->servo_move.position, msg->servo_move.max_velocity,
-                                         msg->servo_move.max_acceleration);
-                break;
-
-            default:
-                rc = -EINVAL;
-                LOG_ERR("Invalid move type: %d", msg->servo_move.abs_or_rel);
-                break;
-        }
-
-        if (rc != 0) {
-            context->uuid = prev_uuid;
-        }
+        return -ENOENT;
     }
 
-    if (rc == 0) {
-        rc = COMMAND_NOT_COMPLETE;
+    // A finished move the status work hasn't acknowledged yet is acknowledged now, so its uuid isn't overwritten.
+    servo_consume_completion(motor_id);
+    if (ack_pending[motor_id]) {
+        // Still running, or it finished after the check above and the next status work acknowledges it.
+        LOG_ERR("Servo %d move refused: the previous one hasn't completed", motor_id);
+        return -EBUSY;
     }
 
-    return rc;
+    // Claim the completion before starting, in case the move finishes first.
+    context->uuid = msg->uuid;
+    ack_pending[motor_id] = true;
+
+    switch (msg->servo_move.abs_or_rel) {
+        case JERRYCAN_MOVE_ABSOLUTE:
+            // Move the servo to the absolute position
+            rc = servo_move_to_position(dev, msg->servo_move.position, msg->servo_move.max_velocity,
+                                        msg->servo_move.max_acceleration);
+            break;
+
+        case JERRYCAN_MOVE_RELATIVE:
+            // Move the servo to the relative position
+            rc = servo_move_relative(dev, msg->servo_move.position, msg->servo_move.max_velocity,
+                                     msg->servo_move.max_acceleration);
+            break;
+
+        default:
+            rc = -EINVAL;
+            LOG_ERR("Invalid move type: %d", msg->servo_move.abs_or_rel);
+            break;
+    }
+
+    if (rc != 0) {
+        ack_pending[motor_id] = false;
+        return rc;
+    }
+
+    return COMMAND_NOT_COMPLETE;
 }
 
 static jerrycan_rx_callback_t servo_callback = {
@@ -206,7 +236,9 @@ static jerrycan_rx_callback_t servo_cfg_read_callback = {
     .func = servo_cfg_read_handler,
 };
 
-static void jerrycan_servo_status_tx() {
+static void jerrycan_servo_status_tx(struct k_work *work) {
+    ARG_UNUSED(work);
+
     for (int motor_id = 0; motor_id < SERVO_COUNT; motor_id++) {
         const struct device *servo = servo_motor_by_id(motor_id);
 
@@ -216,14 +248,7 @@ static void jerrycan_servo_status_tx() {
         }
         struct servo_work_context *context = find_servo_context_from_device(servo);
 
-        if (context->motion_mode == MOTION_DONE) {
-            jerrycan_send_ack(context->uuid, 0);
-            context->motion_mode = MOTION_IDLE;
-        } else if (context->motion_mode == MOTION_FAULT) {
-            // The e-stop stopped this move short of its target.
-            jerrycan_send_ack(context->uuid, -ECANCELED);
-            context->motion_mode = MOTION_IDLE;
-        }
+        servo_consume_completion(motor_id);
 
         jerrycan_msg_t msg = {
             .type = JERRYCAN_CMD_SERVO_STATUS,
@@ -241,7 +266,16 @@ static void jerrycan_servo_status_tx() {
     }
 }
 
-K_TIMER_DEFINE(jerrycan_servo_status_tx_timer, jerrycan_servo_status_tx, NULL);
+static K_WORK_DEFINE(jerrycan_servo_status_tx_work, jerrycan_servo_status_tx);
+
+// The completion sweep shares `ack_pending` and the uuid with the move handler, so it runs in a cooperative thread
+// like the handler rather than in the timer ISR, where it could interleave with a command's claim.
+static void jerrycan_servo_status_tx_timer_expiry(struct k_timer *timer) {
+    ARG_UNUSED(timer);
+    k_work_submit(&jerrycan_servo_status_tx_work);
+}
+
+K_TIMER_DEFINE(jerrycan_servo_status_tx_timer, jerrycan_servo_status_tx_timer_expiry, NULL);
 
 static int jerrycan_servo_init() {
     jerrycan_register_rx_callback(&servo_callback);

@@ -145,6 +145,21 @@ menuconfig LIB_JERRYCAN_INIT_PRIORITY
     help
       The initialization priority of the JerryCAN library.
 
+config LIB_JERRYCAN_ESTOP_PRIORITY
+    int "E-stop work queue priority"
+    default -4
+    depends on LIB_JERRYCAN
+    help
+      Priority of the thread that stops the motors once an ESTOP message has latched the e-stop. It must outrank
+      the thread running jerrycan_run() and the motor motion work queue, so a stop never waits behind either.
+
+config LIB_JERRYCAN_ESTOP_STACK_SIZE
+    int "E-stop work queue stack size"
+    default 1024
+    depends on LIB_JERRYCAN
+    help
+      Stack size of the thread that stops the motors after an ESTOP message.
+
 config LIB_JERRYCAN_AUDIO_PRIORITY
    int "Initialization Priority for CANbus modules"
     default -1 if !CONFIG_DT_HAS_LL_MICROPHONE_ENABLED

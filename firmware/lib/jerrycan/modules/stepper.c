@@ -72,23 +72,60 @@ static bool ack_pending[STEPPER_COUNT];
 static bool fixed_sequence_running(void) { return moving_state != MOVING_NONE; }
 
 /**
- * Before starting a motion, take motor `motor_id`'s next completion for `uuid`. Claiming first covers a motion that
- * finishes before the command returns; `release_completion` gives the claim back if it didn't start, so a motion
- * that was already running keeps its own uuid.
+ * Acknowledge motor `motor_id`'s finished motion, if it has one, and return it to MOTION_IDLE: a single move or
+ * homing with its own uuid, or the fixed-XYZ sequence, which ends on a fault.
  */
-static void claim_completion(struct stepper_work_context *context, const uint8_t motor_id, const uint8_t uuid,
-                             uint8_t *prev_uuid, bool *prev_pending) {
-    *prev_uuid = context->uuid;
-    *prev_pending = ack_pending[motor_id];
-    context->uuid = uuid;
-    ack_pending[motor_id] = true;
+static void consume_completion(const int motor_id) {
+    const struct device *dev = stepper_motor_by_id(motor_id);
+    struct stepper_work_context *context = find_stepper_context_from_device(dev);
+    if (context == NULL) {
+        return;
+    }
+
+    if (context->motion_mode == MOTION_DONE) {
+        LOG_INF("Motion Complete for %d. state=%d. uuid=%d", motor_id, moving_state, context->uuid);
+        context->motion_mode = MOTION_IDLE;
+        if (ack_pending[motor_id]) {
+            jerrycan_send_ack(context->uuid, 0);
+            ack_pending[motor_id] = false;
+        }
+    } else if (context->motion_mode == MOTION_FAULT) {
+        // The protection aborted this move, homing found its limit switch defective, or the e-stop stopped it.
+        // Fail the command it belongs to: a single move or homing, or the fixed-XYZ sequence, which ends.
+        const int error = stepper_motion_error(dev);
+        LOG_ERR("Motion fault for %d. state=%d. uuid=%d. error=%d", motor_id, moving_state, context->uuid, error);
+        context->motion_mode = MOTION_IDLE;
+        if (ack_pending[motor_id]) {
+            jerrycan_send_ack(context->uuid, error);
+            ack_pending[motor_id] = false;
+        } else if (fixed_sequence_running()) {
+            jerrycan_send_ack(fixed_sequence_uuid, error);
+            moving_state = MOVING_NONE;
+        }
+    }
 }
 
-static void release_completion(struct stepper_work_context *context, const uint8_t motor_id, const uint8_t prev_uuid,
-                               const bool prev_pending) {
-    context->uuid = prev_uuid;
-    ack_pending[motor_id] = prev_pending;
+/**
+ * Before starting a motion, take motor `motor_id`'s next completion for `uuid`. A finished motion the status work
+ * hasn't acknowledged yet is acknowledged first, so its uuid isn't overwritten. Claiming before starting covers a
+ * motion that finishes before the command returns; `release_completion` gives the claim back if it didn't start.
+ *
+ * @return 0, or -EBUSY while the previous motion's completion is still pending: it is still running, or it
+ *         finished after the check above, which the next status work will acknowledge.
+ */
+static int claim_completion(struct stepper_work_context *context, const uint8_t motor_id, const uint8_t uuid) {
+    consume_completion(motor_id);
+    if (ack_pending[motor_id]) {
+        LOG_ERR("Stepper %d command refused: the previous one hasn't completed", motor_id);
+        return -EBUSY;
+    }
+
+    context->uuid = uuid;
+    ack_pending[motor_id] = true;
+    return 0;
 }
+
+static void release_completion(const uint8_t motor_id) { ack_pending[motor_id] = false; }
 
 static int stepper_move_handler(const jerrycan_msg_t *msg) {
     // If we receive a stepper message, we should move the stepper
@@ -116,11 +153,11 @@ static int stepper_move_handler(const jerrycan_msg_t *msg) {
         return -EBUSY;
     }
 
-    uint8_t prev_uuid;
-    bool prev_pending;
-    claim_completion(context, move->motor_id, msg->uuid, &prev_uuid, &prev_pending);
+    int rc = claim_completion(context, move->motor_id, msg->uuid);
+    if (rc != 0) {
+        return rc;
+    }
 
-    int rc;
     switch (msg->stepper_move.abs_or_rel) {
         case JERRYCAN_MOVE_ABSOLUTE:
             // Move the stepper to the absolute position
@@ -139,7 +176,7 @@ static int stepper_move_handler(const jerrycan_msg_t *msg) {
     }
 
     if (rc != 0) {
-        release_completion(context, move->motor_id, prev_uuid, prev_pending);
+        release_completion(move->motor_id);
         return rc;
     }
 
@@ -211,29 +248,7 @@ static bool is_motor_motion_complete(moving_state_t state) {
 
 static void stepper_handle_motion_complete() {
     for (int i = 0; i < STEPPER_COUNT; ++i) {
-        const struct device *dev = stepper_motor_by_id(i);
-        struct stepper_work_context *context = find_stepper_context_from_device(dev);
-        if (context && context->motion_mode == MOTION_DONE) {
-            LOG_INF("Motion Complete for %d. state=%d. uuid=%d", i, moving_state, context->uuid);
-            context->motion_mode = MOTION_IDLE;
-            if (ack_pending[i]) {
-                jerrycan_send_ack(context->uuid, 0);
-                ack_pending[i] = false;
-            }
-        } else if (context && context->motion_mode == MOTION_FAULT) {
-            // The protection aborted this move, homing found its limit switch defective, or the e-stop stopped it.
-            // Fail the command it belongs to: a single move or homing, or the fixed-XYZ sequence, which ends.
-            const int error = stepper_motion_error(dev);
-            LOG_ERR("Motion fault for %d. state=%d. uuid=%d. error=%d", i, moving_state, context->uuid, error);
-            context->motion_mode = MOTION_IDLE;
-            if (ack_pending[i]) {
-                jerrycan_send_ack(context->uuid, error);
-                ack_pending[i] = false;
-            } else if (fixed_sequence_running()) {
-                jerrycan_send_ack(fixed_sequence_uuid, error);
-                moving_state = MOVING_NONE;
-            }
-        }
+        consume_completion(i);
     }
 }
 
@@ -403,13 +418,12 @@ static int stepper_home_handler(const jerrycan_msg_t *msg) {
     } else {
         LOG_INF("Homing motor %d with UUID=%d", msg->stepper_home.motor_id, msg->uuid);
 
-        uint8_t prev_uuid;
-        bool prev_pending;
-        claim_completion(context, msg->stepper_home.motor_id, msg->uuid, &prev_uuid, &prev_pending);
-
-        rc = stepper_home(dev);
-        if (rc != 0) {
-            release_completion(context, msg->stepper_home.motor_id, prev_uuid, prev_pending);
+        rc = claim_completion(context, msg->stepper_home.motor_id, msg->uuid);
+        if (rc == 0) {
+            rc = stepper_home(dev);
+            if (rc != 0) {
+                release_completion(msg->stepper_home.motor_id);
+            }
         }
     }
 
@@ -452,7 +466,7 @@ static uint8_t stepper_driver_status(const struct device *stepper) {
         if (faults & ADI_TMC2209_FAULT_WRITE_LOST) {
             status |= JERRYCAN_STEPPER_STATUS_DRIVER_WRITE_LOST;
         }
-        if (faults & ADI_TMC2209_FAULT_READBACK) {
+        if ((faults & ADI_TMC2209_FAULT_READBACK) || stepper_microsteps_unverified(stepper)) {
             status |= JERRYCAN_STEPPER_STATUS_DRIVER_READBACK_FAULT;
         }
     }
