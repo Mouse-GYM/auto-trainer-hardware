@@ -38,6 +38,8 @@ typedef struct {
     int32_t position;
     struct dma_config dma_cfg;
     int dma_channel;
+    atomic_t output_enabled;
+    struct k_spinlock output_lock;
     sys_slist_t callbacks;
     const struct device *motor_device;  // Horrible kludge but necessary to overcome deficiencies with GPIO driver.
     struct gpio_callback limit_switch_cb;
