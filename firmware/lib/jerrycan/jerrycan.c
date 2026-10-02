@@ -41,6 +41,7 @@ static uint8_t get_can_node_id() {
 // Return the payload size for a given message type
 static uint8_t jerrycan_msg_get_payload_size(jerrycan_cmd_type_t msg_type) {
     static const uint8_t jerrycan_size_map[] = {
+        [JERRYCAN_CMD_UPTIME] = sizeof(jerrycan_cmd_uptime_t),
         [JERRYCAN_CMD_ESTOP] = sizeof(jerrycan_cmd_estop_t),
         [JERRYCAN_CMD_HEARTBEAT] = sizeof(jerrycan_cmd_heartbeat_t),
         [JERRYCAN_CMD_STATUS] = sizeof(jerrycan_cmd_status_t),
@@ -103,6 +104,16 @@ int jerrycan_tx(jerrycan_msg_t *msg, k_timeout_t timeout) {
     return ret;
 }
 
+
+int jerrycan_send_uptime(int64_t msecs) {
+    jerrycan_msg_t response = {
+        .type = JERRYCAN_CMD_UPTIME,
+        .uptime = {.msecs = msecs}
+    };
+    return jerrycan_tx(&response, K_NO_WAIT);
+}
+
+
 // Consolidated function for TX and RX handling
 int jerrycan_run(k_timeout_t timeout) {
     static jerrycan_msg_t msg;
@@ -119,6 +130,7 @@ int jerrycan_run(k_timeout_t timeout) {
         K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_MSGQ_DATA_AVAILABLE, K_POLL_MODE_NOTIFY_ONLY, &jerrycan_tx_msgq, 1),
         K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_MSGQ_DATA_AVAILABLE, K_POLL_MODE_NOTIFY_ONLY, &jerrycan_rx_msgq,
                                         2)};
+
 
     // Poll for events in the RX and TX queues
     ret = k_poll(events, sizeof(events) / sizeof(struct k_poll_event), timeout);

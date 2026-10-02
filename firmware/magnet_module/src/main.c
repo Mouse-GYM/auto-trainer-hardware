@@ -8,6 +8,8 @@ LOG_MODULE_REGISTER(app);
 int main() {
     LOG_INF("Autotrainer Magnet Module v%s", APP_VERSION_STRING);
 
+    jerrycan_send_uptime(0);
+
     while (true) {
         jerrycan_run(K_FOREVER);
     }
