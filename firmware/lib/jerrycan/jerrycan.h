@@ -16,4 +16,4 @@ int jerrycan_tx(jerrycan_msg_t *msg, k_timeout_t timeout);
 
 void jerrycan_send_ack(uint8_t uuid, int error_code);
 
-int jerrycan_send_uptime(int64_t msecs);
+int jerrycan_send_uptime(int64_t msecs, uuid_t uuid, bool is_boot);

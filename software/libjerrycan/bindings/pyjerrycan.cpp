@@ -380,9 +380,12 @@ PYBIND11_MODULE(pyjerrycan, m) {
         .def_readwrite("bytes_written", &jerrycan_cmd_bootloader_status_t::bytes_written)
     ;
 
-    py::class_<jerrycan_cmd_uptime_t>(m, "BootloaderUptime")
+    py::class_<jerrycan_cmd_uptime_t>(m, "Uptime")
         .def(py::init<>())
         .def_readwrite("msecs", &jerrycan_cmd_uptime_t::msecs)
+        .def_property("is_boot",
+            [](const jerrycan_cmd_uptime_t &self) { return self.is_boot; },
+            [](jerrycan_cmd_uptime_t &self, const uint8_t value) { self.is_boot = value; })
     ;
 
     py::class_<jerrycan_cmd_bootloader_version_t>(m, "BootloaderVersion")

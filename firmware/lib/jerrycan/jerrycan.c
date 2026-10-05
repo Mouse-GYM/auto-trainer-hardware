@@ -105,10 +105,11 @@ int jerrycan_tx(jerrycan_msg_t *msg, k_timeout_t timeout) {
 }
 
 
-int jerrycan_send_uptime(int64_t msecs) {
+int jerrycan_send_uptime(int64_t msecs, uuid_t uuid, bool is_boot) {
     jerrycan_msg_t response = {
         .type = JERRYCAN_CMD_UPTIME,
-        .uptime = {.msecs = msecs}
+        .uuid = uuid,
+        .uptime = {.msecs = msecs, .is_boot = is_boot}
     };
     return jerrycan_tx(&response, K_NO_WAIT);
 }

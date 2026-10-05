@@ -18,7 +18,10 @@ LOG_MODULE_DECLARE(jerrycan, CONFIG_LIB_JERRYCAN_LOG_LEVEL);
 // #define UPTIME_COUNT DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT)
 
 static int jerrycan_uptime_write_handler(const jerrycan_msg_t *msg) {
-    int ret = jerrycan_send_uptime(k_uptime_get());
+    int ret = jerrycan_send_uptime(k_uptime_get(), msg->uuid, false);
+    if (ret == 0) {
+        return SEND_NO_ACKNOWLEDGEMENT;
+    }
     return ret;
 }
 
@@ -29,13 +32,16 @@ static jerrycan_rx_callback_t uptime_callback = {
 
 
 static void jerrycan_uptime_timer_tx() {
-    jerrycan_send_uptime(k_uptime_get());
+    jerrycan_send_uptime(k_uptime_get(), 0, false);
 }
 
 K_TIMER_DEFINE(jerrycan_uptime_timer, jerrycan_uptime_timer_tx, NULL);
 
 
 static int jerrycan_uptime_init() {
+
+    jerrycan_send_uptime(k_uptime_get(), 0, true);
+
     jerrycan_register_rx_callback(&uptime_callback);
 
     k_timer_start(&jerrycan_uptime_timer, K_MSEC(500), K_SECONDS(1));

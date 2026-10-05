@@ -339,9 +339,10 @@ SIZE_CHECK(jerrycan_cmd_bootloader_status_t, 5);
 
 typedef struct __attribute__((packed)) {
     int64_t msecs;
+    uint8_t is_boot : 1;
 } jerrycan_cmd_uptime_t;
 
-SIZE_CHECK(jerrycan_cmd_uptime_t, 8);
+SIZE_CHECK(jerrycan_cmd_uptime_t, 9);
 
 typedef struct __attribute__((packed)) {
     jerrycan_bootloader_subcmd_t type;
