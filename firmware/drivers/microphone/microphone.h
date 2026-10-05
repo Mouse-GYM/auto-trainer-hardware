@@ -32,7 +32,7 @@
  * @param[out] block_size - Non-NULL pointer, will contain the number of samples read across all channels
  *
  * @retval 0 - OK
- * @retval EAGAIN - No data available
+ * @retval -EAGAIN - No data available
  * @retval <0 - Error code
  */
 [[nodiscard]] int ll_microphone_read(const struct device* device, void** mem_block, uint32_t* block_size);
@@ -54,3 +54,13 @@ void ll_microphone_release_buffer(const struct device* device, void* mem_block);
  * @return Number of input channels
  */
 int ll_microphone_channel_count(const struct device* device);
+
+
+/**
+ * Perform a flush and restart of the device reading. Returns 0 on success, else error code (-errno)
+ *
+ * @param device - Microphone device; Can not be NULL
+ *
+ * @return Number of input channels
+ */
+int ll_microphone_reset_read(const struct device* device);
