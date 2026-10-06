@@ -75,6 +75,7 @@ int JerryCAN::Close() {
 // Return the payload size for a given message type
 static uint8_t jerrycan_msg_get_payload_size(const jerrycan_cmd_type_t msg_type) {
     static const std::map<jerrycan_cmd_type_t, ssize_t> jerrycan_size_map = {
+        {JERRYCAN_CMD_UPTIME, sizeof(jerrycan_cmd_uptime_t)},
         {JERRYCAN_CMD_ESTOP, sizeof(jerrycan_cmd_estop_t)},
         {JERRYCAN_CMD_HEARTBEAT, sizeof(jerrycan_cmd_heartbeat_t)},
         {JERRYCAN_CMD_STATUS, sizeof(jerrycan_cmd_status_t)},
