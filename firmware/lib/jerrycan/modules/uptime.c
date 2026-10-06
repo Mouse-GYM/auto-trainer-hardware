@@ -17,6 +17,17 @@ LOG_MODULE_DECLARE(jerrycan, CONFIG_LIB_JERRYCAN_LOG_LEVEL);
 /* Number of enabled uptime instances found in the device tree */
 // #define UPTIME_COUNT DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT)
 
+
+static int jerrycan_send_uptime(int64_t msecs, uuid_t uuid, bool is_boot) {
+    jerrycan_msg_t response = {
+        .type = JERRYCAN_CMD_UPTIME,
+        .uuid = uuid,
+        .uptime = {.msecs = msecs, .is_boot = is_boot}
+    };
+    return jerrycan_tx(&response, K_NO_WAIT);
+}
+
+
 static int jerrycan_uptime_write_handler(const jerrycan_msg_t *msg) {
     int ret = jerrycan_send_uptime(k_uptime_get(), msg->uuid, false);
     if (ret == 0) {
