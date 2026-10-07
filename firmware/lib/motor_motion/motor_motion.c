@@ -20,9 +20,7 @@ void motor_motion_servo_set_current_position(servo_motor_context_t *context, con
 }
 
 void stepper_motor_stop(const struct device *dev) {
-    struct stepper_work_context *context = find_stepper_context_from_device(dev);
-    context->motion_mode = MOTION_DONE;
-
+    stepper_cancel_all_work(dev);
     ll_stepper_disable(dev);
 }
 

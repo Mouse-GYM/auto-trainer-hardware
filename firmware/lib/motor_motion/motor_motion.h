@@ -16,10 +16,10 @@ void motor_motion_stepper_set_current_position(stepper_motor_context_t *context,
  */
 void motor_motion_servo_set_current_position(servo_motor_context_t *context, float position);
 
-/*
- * Stop the motor by stopping the timer and the DMA. This does not affect the internal state of the motion library.
- */
+/* Stop the stepper by cancelling pending motion work, then stopping its timer and DMA. */
 void stepper_motor_stop(const struct device *dev);
+
+/* Stop servo pulse generation. */
 void servo_motor_stop(const struct device *dev);
 
 /*
