@@ -212,7 +212,7 @@ jobs:
   jerrycan-updater:
     name: JerryCAN updater (${{ matrix.platform }})
     needs: changes
-    if: needs.changes.outputs.jerrycan_updater == 'true' || github.ref_type == 'tag'
+    if: needs.changes.outputs.firmware == 'true' || needs.changes.outputs.jerrycan_updater == 'true' || github.ref_type == 'tag'
     runs-on: ${{ fromJSON(matrix.runner) }}
     strategy:
       fail-fast: false

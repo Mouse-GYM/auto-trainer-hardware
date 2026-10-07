@@ -127,6 +127,10 @@ struct stepper_work_context {
     float homing_velocity;
     float motor_steps_per_revolution;
     float fixed_position;
+    // The only value the settings export may write. It tracks `fixed_position` except when
+    // CONFIG_LIB_MOTOR_MOTION_DEFER_STEPPER_FIXED_POSITION holds the stored record out of the live field,
+    // where it keeps that record from being exported back over as a 0.
+    float persisted_fixed_position;
     uint16_t microsteps;  // micro steps per step; should be a power of 2.
     // The driver didn't confirm `microsteps` at boot, so planner and driver may disagree on the step size. Moves
     // and homing are refused until a configuration write sets microsteps successfully.

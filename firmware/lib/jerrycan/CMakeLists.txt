@@ -7,6 +7,7 @@ zephyr_library_sources(
 	       modules/heartbeat.c
 	       modules/status.c
 	       modules/gpio.c
+		   modules/uptime.c
 )
 
 # If this board has the motor motion library enabled, include the stepper and servo files

@@ -61,6 +61,7 @@ typedef enum __attribute__((packed)) {
     JERRYCAN_CMD_STEPPER_FAULT_CLEAR = 0x1F,
     JERRYCAN_RSP_ACK = 0x30,
     JERRYCAN_CMD_MIN = 0x00,
+    JERRYCAN_CMD_UPTIME = 0x2E,
     JERRYCAN_CMD_MAX = 0x3F,
 } jerrycan_cmd_type_t;
 
@@ -374,6 +375,13 @@ typedef struct __attribute__((packed)) {
 SIZE_CHECK(jerrycan_cmd_bootloader_status_t, 5);
 
 typedef struct __attribute__((packed)) {
+    int64_t msecs;
+    uint8_t is_boot : 1;
+} jerrycan_cmd_uptime_t;
+
+SIZE_CHECK(jerrycan_cmd_uptime_t, 9);
+
+typedef struct __attribute__((packed)) {
     jerrycan_bootloader_subcmd_t type;
     union {
         jerrycan_cmd_bootloader_version_t version;
@@ -442,6 +450,7 @@ typedef struct __attribute__((packed)) {
                 jerrycan_cmd_bootloader_response_t bootloader_response;
                 jerrycan_cmd_delay_t delay;
                 jerrycan_cmd_fixed_xyz fixed_xyz;
+                jerrycan_cmd_uptime_t uptime;
                 jerrycan_rsp_ack_t ack;
             };
             uuid_t uuid;
