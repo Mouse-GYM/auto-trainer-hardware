@@ -93,7 +93,8 @@ menuconfig LIB_JERRYCAN_TEMPERATURE_SENSOR
   depends on DT_HAS_SENSIRION_SHT3XD_ENABLED
   select SHT3XD
   help
-    Enable the JerryCAN Temperature Sensor moduule
+    Enable the JerryCAN Temperature Sensor module
+
 
 menuconfig LIB_JERRYCAN_DOOR_SENSOR
     bool "Enable Door Sensors"
