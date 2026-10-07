@@ -58,9 +58,9 @@ typedef enum __attribute__((packed)) {
     JERRYCAN_CMD_FIXED_XYZ = 0x1C,
     JERRYCAN_CMD_SERVO_ATTACH = 0x1D,
     JERRYCAN_CMD_SERVO_DETACH = 0x1E,
-    JERRYCAN_CMD_UPTIME = 0x1F,
     JERRYCAN_RSP_ACK = 0x30,
     JERRYCAN_CMD_MIN = 0x00,
+    JERRYCAN_CMD_UPTIME = 0x2E,
     JERRYCAN_CMD_MAX = 0x3F,
 } jerrycan_cmd_type_t;
 
