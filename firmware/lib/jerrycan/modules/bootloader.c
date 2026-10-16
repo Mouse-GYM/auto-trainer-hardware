@@ -53,8 +53,13 @@ void confirm_image() {
 // Send a JERRYCAN_CMD_BOOTLOADER_RESPONSE message with the currently running firmware version and the version in Slot 1
 static void jerrycan_bootloader_send_version() {
     // Get the version in Slot 1
-    struct mcuboot_img_header header;
-    boot_read_bank_header(SLOT1_PARTITION_ID, &header, sizeof(header));
+    // An empty or unreadable slot 1 reports version 0.0.0 rather than whatever was on the stack.
+    struct mcuboot_img_header header = {0};
+    const int ret = boot_read_bank_header(SLOT1_PARTITION_ID, &header, sizeof(header));
+    if (ret != 0) {
+        LOG_WRN("Failed to read slot 1 header: %d", ret);
+        header = (struct mcuboot_img_header){0};
+    }
 
     // Craft the response message with the running version and the slot1 version
     jerrycan_msg_t response = {
@@ -139,8 +144,7 @@ static int jerrycan_bootloader_flash_end() {
 
 static int jerrycan_bootloader_rx_command_handler(const jerrycan_msg_t *msg) {
     int ret = -EINVAL;
-    jerrycan_msg_t resp;
-    resp.type = JERRYCAN_CMD_BOOTLOADER_RESPONSE;
+    jerrycan_msg_t resp = {.type = JERRYCAN_CMD_BOOTLOADER_RESPONSE};
 
     switch (msg->bootloader_command.type) {
         case JERRYCAN_BOOTLOADER_SUBCMD_VERSION:
@@ -183,8 +187,7 @@ static int jerrycan_bootloader_rx_command_handler(const jerrycan_msg_t *msg) {
 }
 
 static int jerrycan_bootloader_rx_data_handler(const jerrycan_msg_t *msg) {
-    jerrycan_msg_t resp;
-    resp.type = JERRYCAN_CMD_BOOTLOADER_RESPONSE;
+    jerrycan_msg_t resp = {.type = JERRYCAN_CMD_BOOTLOADER_RESPONSE};
 
     // If the START command hasn't been issued yet, don't accept data.  Respond with a NACK
     if (!bootloader_ctx.bootloader_active) {
@@ -194,22 +197,25 @@ static int jerrycan_bootloader_rx_data_handler(const jerrycan_msg_t *msg) {
         return SEND_NO_ACKNOWLEDGEMENT;
     }
 
+    // An erase failure is NACKed like a write failure. A generic ack here would carry a stale uuid: this message
+    // fills the whole payload, so it has none of its own.
     int ret = erase_page(bootloader_ctx.offset);
-    if (ret) {
-        return ret;
+    if (ret == 0) {
+        // Write the data to the flash image
+        ret = flash_img_buffered_write(&bootloader_ctx.flash_img_ctx, msg->bootloader_data.data,
+                                       sizeof(msg->bootloader_data.data), true);
+        if (ret) {
+            LOG_ERR("Failed to write image data: %d", ret);
+        } else {
+            bootloader_ctx.offset += sizeof(msg->bootloader_data.data);
+        }
     }
 
-    // Write the data to the flash image
-    ret = flash_img_buffered_write(&bootloader_ctx.flash_img_ctx, msg->bootloader_data.data,
-                                   sizeof(msg->bootloader_data.data), true);
-    if (ret) {
-        LOG_ERR("Failed to write image data: %d", ret);
-    } else {
-        bootloader_ctx.offset += sizeof(msg->bootloader_data.data);
-    }
-
-    // Send an ACK response to indicate that the data was written successfully
+    // Send an ACK response to indicate that the data was written successfully, with the progress the command
+    // handler's responses report
     resp.bootloader_response.type = ret == 0 ? JERRYCAN_BOOTLOADER_SUBCMD_ACK : JERRYCAN_BOOTLOADER_SUBCMD_NACK;
+    resp.bootloader_response.status.active = bootloader_ctx.bootloader_active;
+    resp.bootloader_response.status.bytes_written = flash_img_bytes_written(&bootloader_ctx.flash_img_ctx);
     jerrycan_tx(&resp, K_NO_WAIT);
 
     return SEND_NO_ACKNOWLEDGEMENT;

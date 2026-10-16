@@ -107,6 +107,19 @@ bool ll_stepper_is_enabled(const struct device *dev) {
     return ret == 1;
 }
 
+int ll_stepper_abort(const struct device *dev) {
+    const ll_motor_cfg_t *cfg = dev->config;
+
+    // With interrupts locked the DMA callback can't reload a block between the stop and the purge.
+    const unsigned int key = irq_lock();
+    const int ret = ll_stepper_disable(dev);
+    LL_TIM_DisableCounter(cfg->timer);
+    k_msgq_purge(cfg->msgq);
+    irq_unlock(key);
+
+    return ret;
+}
+
 int ll_stepper_dma_stop(const struct device *dev) {
     const ll_motor_cfg_t *cfg = dev->config;
     const ll_motor_data_t *data = dev->data;

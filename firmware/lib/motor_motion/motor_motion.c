@@ -22,8 +22,10 @@ void motor_motion_servo_set_current_position(servo_motor_context_t *context, con
 void stepper_motor_stop(const struct device *dev) {
     struct stepper_work_context *context = find_stepper_context_from_device(dev);
     context->motion_mode = MOTION_DONE;
+    // No more refills; drop blocks still queued (homing keeps two) so the next move starts from an empty queue.
+    context->motion_calculation_done = true;
 
-    ll_stepper_disable(dev);
+    ll_stepper_abort(dev);
 }
 
 void servo_motor_stop(const struct device *dev) { ll_servo_enable(dev, false); }
@@ -38,15 +40,32 @@ void motors_all_stop(void) {
     }
 
     for (size_t i = 0; i < ARRAY_SIZE(servo_motors); i++) {
-        servo_motor_stop(stepper_motors[i]);
+        servo_motor_stop(servo_motors[i]);
     }
 }
 
+static atomic_t e_stop_engaged_flag;
+
 void trigger_e_stop(void) {
-    motors_all_stop();
+    // Engage first, so no new move can start while the running ones are stopped.
+    atomic_set(&e_stop_engaged_flag, 1);
+
+    for (size_t i = 0; i < ARRAY_SIZE(stepper_motors); i++) {
+        stepper_e_stop(stepper_motors[i]);
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(servo_motors); i++) {
+        servo_e_stop(servo_motors[i]);
+    }
 
     set_all_e_stop_flags();
 }
+
+void latch_e_stop(void) { atomic_set(&e_stop_engaged_flag, 1); }
+
+void release_e_stop(void) { atomic_set(&e_stop_engaged_flag, 0); }
+
+bool e_stop_engaged(void) { return atomic_get(&e_stop_engaged_flag) != 0; }
 
 const struct device *stepper_motor_by_id(const size_t id) {
     if (id >= ARRAY_SIZE(stepper_motors)) {

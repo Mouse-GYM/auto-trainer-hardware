@@ -4,6 +4,7 @@
 #include <fenv.h>
 #include <float.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifdef BENCH_TEST
@@ -307,6 +308,16 @@ static uint32_t degrees_to_pwm_count(const servo_motor_context_t *context, const
     return roundf(pwm);
 }
 
+float motor_motion_servo_pwm_count_to_degrees(const servo_motor_context_t *context, const uint32_t count) {
+    const float scale_factor = (context->max_angle_pwm - context->min_angle_pwm) / FULL_RANGE_IN_DEGREES;
+    if (scale_factor == 0.0f) {
+        return NAN;
+    }
+
+    const float scaled_position = (float)count * context->pwm_timer_increment - context->min_angle_pwm;
+    return scaled_position / scale_factor + context->min_angle + context->angle_adjustment;
+}
+
 ssize_t motor_motion_servo_generate_displacement_table(uint32_t *table, const size_t table_size,
                                                        servo_motor_context_t *context) {
     const float SERVO_TIME_STEP = 0.02f;
@@ -383,11 +394,13 @@ static float revolutions_to_steps(const stepper_motor_context_t *context, const 
     return revolutions * context->steps_per_revolution;
 }
 
-ssize_t motor_motion_stepper_generate_timing_table(uint32_t *table, const size_t table_size,
-                                                   stepper_motor_context_t *context) {
+/*
+ * Pulse timings of the profile from `last_position_generated` up to, but not past, `end_pos`.
+ */
+static ssize_t generate_timing_table_until(uint32_t *table, const size_t table_size, stepper_motor_context_t *context,
+                                           const float end_pos) {
     const float time_step = context->timer_increment;
-    const float n_steps_to_finish =
-        revolutions_to_steps(context, context->motion_profile.end_pos - context->last_position_generated);
+    const float n_steps_to_finish = revolutions_to_steps(context, end_pos - context->last_position_generated);
     ssize_t n_entries = (ssize_t)fabsf(n_steps_to_finish / context->min_step);
 
     if (n_entries > table_size) {
@@ -430,4 +443,15 @@ ssize_t motor_motion_stepper_generate_timing_table(uint32_t *table, const size_t
     context->last_time_generated = this_time;
 
     return n_entries;
+}
+
+ssize_t motor_motion_stepper_generate_timing_table(uint32_t *table, const size_t table_size,
+                                                   stepper_motor_context_t *context) {
+    return generate_timing_table_until(table, table_size, context, context->motion_profile.end_pos);
+}
+
+ssize_t motor_motion_stepper_generate_ramp_table(uint32_t *table, const size_t table_size,
+                                                 stepper_motor_context_t *context) {
+    const motor_motion_profile_t *profile = &context->motion_profile;
+    return generate_timing_table_until(table, table_size, context, profile->start_pos + profile->sgn * profile->y_a);
 }

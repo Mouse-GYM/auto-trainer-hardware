@@ -149,7 +149,11 @@ static int cmd_load_cell_tare(const struct shell *shell, size_t argc, char **arg
         return -EINVAL;
     }
 
-    int ret = ll_load_cell_tare(load_cell_devs[load_cell]);
+    int ret = ll_load_cell_tare(load_cell_devs[load_cell], NULL, NULL);
+    if (ret == -EBUSY) {
+        shell_print(shell, "Failed to tare load_cell%d: a tare is already in progress", load_cell);
+        return ret;
+    }
     if (ret < 0) {
         shell_print(shell, "Failed to tare load_cell%d: %s", load_cell, k_work_submit_error_to_str[-ret]);
         return ret;

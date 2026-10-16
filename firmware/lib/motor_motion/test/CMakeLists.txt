@@ -24,3 +24,6 @@ target_link_libraries(motor_motion_test
     PRIVATE
         m
 )
+
+enable_testing()
+add_test(NAME motor_math_self_test COMMAND motor_motion_test --self-test)

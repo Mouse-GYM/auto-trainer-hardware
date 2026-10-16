@@ -125,9 +125,26 @@ ssize_t motor_motion_servo_generate_displacement_table(uint32_t *table, size_t t
                                                        servo_motor_context_t *context);
 
 /**
+ * The angle (degrees) a PWM pulse of `count` timer counts drives the servo to: the inverse of the mapping the
+ * displacement table uses.
+ *
+ * @return the angle, or NAN if the PWM endpoints of `context` coincide.
+ */
+float motor_motion_servo_pwm_count_to_degrees(const servo_motor_context_t *context, uint32_t count);
+
+/**
  * Generates a table of values with a pulse at the correct time for each stamp.
  *
  * @return the number of entries generated or -1 on error.
  */
 ssize_t motor_motion_stepper_generate_timing_table(uint32_t *table, size_t table_size,
                                                    stepper_motor_context_t *context);
+
+/**
+ * Like `motor_motion_stepper_generate_timing_table`, but only through the profile's acceleration region: the
+ * pulses that take the motor from rest up to `v_w`, ending at `start_pos + sgn * y_a`. For a ramp up to
+ * `max_velocity`, initialize the context with a displacement of at least 2 * max_velocity^2 / max_acceleration.
+ *
+ * @return the number of entries generated, 0 once the ramp is complete.
+ */
+ssize_t motor_motion_stepper_generate_ramp_table(uint32_t *table, size_t table_size, stepper_motor_context_t *context);

@@ -40,6 +40,8 @@ class JerryCAN {
 
     [[nodiscard]] int StepperHome(uint8_t dst_id, uint8_t motor_id, uuid_t uuid) const;
 
+    [[nodiscard]] int StepperFaultClear(uint8_t dst_id, uint8_t motor_id, uuid_t uuid) const;
+
     [[nodiscard]] int CfgRead(uint8_t dst_id, const jerrycan_cmd_cfg_t &cfg) const;
 
     [[nodiscard]] int StepperCfgWrite(uint8_t dst_id, uint8_t motor_id, uint16_t microsteps, float steps_per_revolution,

@@ -20,22 +20,80 @@ K_MSGQ_DEFINE(jerrycan_tx_msgq, sizeof(jerrycan_msg_t), 150, 4);
 #define NODE_ID_MASK 0x1F
 static uint8_t can_node_id;
 
+// How long a transmit may wait for a free TX mailbox, and then for the frame to go out. A frame nobody acknowledges
+// (no other node, a wiring fault, bus-off) never completes; without these bounds the first such frame would block
+// the loop that also handles every received command. A healthy bus sends a frame in well under a millisecond.
+#define CAN_TX_MAILBOX_TIMEOUT K_MSEC(50)
+#define CAN_TX_DONE_TIMEOUT K_MSEC(50)
+
+// The one frame handed to the driver and not yet completed. A frame that times out stays outstanding until the
+// driver completes it, so no second frame is accepted meanwhile: its callback can't be mistaken for another
+// frame's, and two frames can't sit in the TX buffers at once, where the controller sends them by CAN ID rather
+// than in order.
+static struct {
+    struct k_sem done;
+    atomic_t outstanding;
+    int status;
+} can_tx;
+
 static inline uint16_t can_id(jerrycan_cmd_type_t msg_type) { return (uint16_t)msg_type << 5 | can_node_id; }
 
-static uint8_t get_can_node_id() {
+static void can_tx_done(const struct device *dev, int error, void *user_data) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+    can_tx.status = error;
+    atomic_clear(&can_tx.outstanding);
+    k_sem_give(&can_tx.done);
+}
+
+/**
+ * Send `frame` and wait, within bounds, for it to complete, so frames still go out one at a time and in order.
+ *
+ * @return 0 once sent; -EAGAIN if the bus didn't take it in time or still holds an earlier frame that timed out;
+ *         or the driver's error, including one it reports after accepting the frame (-ENETUNREACH for bus-off).
+ */
+static int jerrycan_send_frame(const struct can_frame *frame) {
+    if (!atomic_cas(&can_tx.outstanding, 0, 1)) {
+        return -EAGAIN;
+    }
+    k_sem_reset(&can_tx.done);
+
+    const int ret = can_send(can_dev, frame, CAN_TX_MAILBOX_TIMEOUT, can_tx_done, NULL);
+    if (ret != 0) {
+        atomic_clear(&can_tx.outstanding);
+        return ret;
+    }
+
+    if (k_sem_take(&can_tx.done, CAN_TX_DONE_TIMEOUT) != 0) {
+        return -EAGAIN;
+    }
+
+    return can_tx.status;
+}
+
+static int get_can_node_id(uint8_t *can_node_id_out) {
     // Read the DeviceType bits to make sure this is a Pellet Module
-    uint32_t device_type;
-    ll_generic_gpio_read(gpio_dev, 0x3, &device_type);
+    uint32_t device_type = 0;
+    int ret = ll_generic_gpio_read(gpio_dev, 0x3, &device_type);
+    if (ret != 0) {
+        LOG_ERR("Failed to read the device type pins: %d", ret);
+        return ret;
+    }
 
     // Read the NodeID to program up the CAN_ID properly
-    uint32_t node_id;
-    ll_generic_gpio_read(gpio_dev, 0xC, &node_id);
+    uint32_t node_id = 0;
+    ret = ll_generic_gpio_read(gpio_dev, 0xC, &node_id);
+    if (ret != 0) {
+        LOG_ERR("Failed to read the node ID pins: %d", ret);
+        return ret;
+    }
     node_id = (node_id >> 2) & 0x3;
 
     // Print out the device type and node ID
     LOG_INF("CAN_ID: 0x%X", (node_id << 2) | device_type);
 
-    return ((node_id << 2) | device_type) & NODE_ID_MASK;
+    *can_node_id_out = ((node_id << 2) | device_type) & NODE_ID_MASK;
+    return 0;
 }
 
 // Return the payload size for a given message type
@@ -50,6 +108,7 @@ static uint8_t jerrycan_msg_get_payload_size(jerrycan_cmd_type_t msg_type) {
         [JERRYCAN_CMD_SERVO_ATTACH] = sizeof(jerrycan_cmd_servo_attach_t),
         [JERRYCAN_CMD_SERVO_DETACH] = sizeof(jerrycan_cmd_servo_detach_t),
         [JERRYCAN_CMD_STEPPER_HOME] = sizeof(jerrycan_cmd_stepper_home_t),
+        [JERRYCAN_CMD_STEPPER_FAULT_CLEAR] = sizeof(jerrycan_cmd_stepper_fault_clear_t),
         [JERRYCAN_CMD_CFG_WRITE] = sizeof(jerrycan_cmd_cfg_t),
         [JERRYCAN_CMD_CFG_RESPONSE] = sizeof(jerrycan_cmd_cfg_t),
         [JERRYCAN_CMD_CFG_READ] = sizeof(jerrycan_cmd_cfg_t),
@@ -109,6 +168,7 @@ int jerrycan_tx(jerrycan_msg_t *msg, k_timeout_t timeout) {
 int jerrycan_run(k_timeout_t timeout) {
     static jerrycan_msg_t msg;
     static struct can_frame frame;
+    static bool tx_stalled;
     int ret;
 
 #ifdef CONFIG_BOOTLOADER_MCUBOOT
@@ -157,9 +217,23 @@ int jerrycan_run(k_timeout_t timeout) {
             // const uint8_t dlc_bytes = can_dlc_to_bytes(frame.dlc);
             // memset(&frame.data[payload_size], 0, dlc_bytes - payload_size);
 
-            ret = can_send(can_dev, &frame, K_FOREVER, NULL, NULL);
+            ret = jerrycan_send_frame(&frame);
+            if (ret == -EAGAIN || ret == -ENETUNREACH || ret == -ENETDOWN) {
+                // The bus isn't taking frames (timed out, bus-off, or controller stopped). Drop the backlog rather
+                // than waiting on each queued frame in turn, and go on to the received commands.
+                const uint32_t dropped = k_msgq_num_used_get(&jerrycan_tx_msgq);
+                k_msgq_purge(&jerrycan_tx_msgq);
+                if (!tx_stalled) {
+                    LOG_ERR("CAN transmit timed out; dropped %u queued frames", dropped);
+                }
+                tx_stalled = true;
+                break;
+            }
             if (ret != 0) {
                 LOG_ERR("Failed to send CAN frame: %d", ret);
+            } else if (tx_stalled) {
+                LOG_INF("CAN transmit restored");
+                tx_stalled = false;
             }
         }
     }
@@ -211,14 +285,34 @@ void jerrycan_register_rx_callback(jerrycan_rx_callback_t *callback) {
     sys_slist_append(&can_rx_callbacks_list, &callback->node);
 }
 
+static jerrycan_estop_handler_t estop_handler;
+
+void jerrycan_set_estop_handler(const jerrycan_estop_handler_t handler) { estop_handler = handler; }
+
+static void can_estop_rx(const struct device *dev, struct can_frame *frame, void *user_data) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+
+    const jerrycan_estop_handler_t handler = estop_handler;
+    if (handler != NULL && can_dlc_to_bytes(frame->dlc) >= sizeof(jerrycan_cmd_estop_t)) {
+        handler(((const jerrycan_cmd_estop_t *)frame->data)->rsvd != 0);
+    }
+}
+
 static int jerrycan_init() {
     int ret;
 
     // Initialize the linked list that will hold the callbacks to be called on RX frame
     sys_slist_init(&can_rx_callbacks_list);
 
-    // Read this device type and address from GPIOS
-    can_node_id = get_can_node_id();
+    k_sem_init(&can_tx.done, 0, 1);
+
+    // Read this device type and address from GPIOS. Without them the address would be arbitrary, so don't join
+    // the bus at all.
+    ret = get_can_node_id(&can_node_id);
+    if (ret != 0) {
+        return ret;
+    }
 
     // Ensure the CAN device is ready
     if (!device_is_ready(can_dev)) {
@@ -251,6 +345,23 @@ static int jerrycan_init() {
     if (ret) {
         LOG_ERR("Failed to start CAN device: %d", ret);
         return ret;
+    }
+
+    // The controller hands each frame to the first filter element that matches it, and Zephyr fills elements in the
+    // order they're added. The node and broadcast filters below also match ESTOP frames, so these go first.
+    const uint8_t estop_destinations[] = {can_node_id, NODE_ID_MASK};
+    for (size_t i = 0; i < ARRAY_SIZE(estop_destinations); i++) {
+        const struct can_filter jerrycan_estop_filter = {
+            .flags = 0,
+            .id = (uint16_t)JERRYCAN_CMD_ESTOP << 5 | estop_destinations[i],
+            .mask = CAN_STD_ID_MASK,
+        };
+
+        ret = can_add_rx_filter(can_dev, can_estop_rx, NULL, &jerrycan_estop_filter);
+        if (ret < 0) {
+            LOG_ERR("Failed to add CAN e-stop filter: %d", ret);
+            return ret;
+        }
     }
 
     // Add the filter for messages address to this specific device
